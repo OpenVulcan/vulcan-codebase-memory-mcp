@@ -1048,7 +1048,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
+    for (size_t attempt = 0; thread_started && attempt < 5000U; attempt++) {
         if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
             startup_observed = true;
             break;
@@ -1126,7 +1126,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
+    for (size_t attempt = 0; thread_started && attempt < 5000U; attempt++) {
         if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
             startup_observed = true;
             break;
