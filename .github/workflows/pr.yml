@@ -119,7 +119,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/build.sh CC=gcc CXX=g++
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          test "$(build/c/vulcan-codebase-memory-mcp --version)" = \
+            "vulcan-codebase-memory-mcp dev"
+          test ! -e build/c/codebase-memory-mcp
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -128,8 +130,10 @@ jobs:
         if: matrix.os == 'macos-14'
         run: |
           scripts/build.sh CC=cc CXX=c++
-          codesign --sign - --force build/c/codebase-memory-mcp
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          codesign --sign - --force build/c/vulcan-codebase-memory-mcp
+          test "$(build/c/vulcan-codebase-memory-mcp --version)" = \
+            "vulcan-codebase-memory-mcp dev"
+          test ! -e build/c/codebase-memory-mcp
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -139,22 +143,19 @@ jobs:
         shell: msys2 {0}
         run: |
           scripts/build.sh CC=clang CXX=clang++
-          # MSYS2 /tmp is intentionally shared. The launcher correctly rejects
-          # a bundle below that writable ancestor. RUNNER_TEMP is also below
-          # the shared D:\a tree, so stage in the runner account's profile.
-          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
-          SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-pr-smoke.XXXXXX")"
-          trap 'rm -rf "$SMOKE_DIR"' EXIT
-          cp build/c/codebase-memory-mcp-launcher.exe \
-            "$SMOKE_DIR/codebase-memory-mcp.exe"
-          cp build/c/codebase-memory-mcp.exe \
-            "$SMOKE_DIR/codebase-memory-mcp.payload.exe"
-          CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" \
-            SMOKE_TEMP_ROOT="$SMOKE_DIR" \
-            scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
+          test "$(build/c/vulcan-codebase-memory-mcp.exe --version)" = \
+            "vulcan-codebase-memory-mcp dev"
+          test ! -e build/c/codebase-memory-mcp.exe
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+
+      - name: Run dedicated Windows managed E2E
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: >
+          .\scripts\test-vulcan-managed-windows.ps1
+          -Executable .\build\c\vulcan-codebase-memory-mcp.exe
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage

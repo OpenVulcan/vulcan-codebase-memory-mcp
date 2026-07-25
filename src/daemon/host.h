@@ -18,6 +18,9 @@ typedef struct {
      * disconnect and the no-client initial window; it stops only through the
      * stop/drain ops or an explicit process kill. */
     bool permanent;
+    /* Explicit Vulcan-managed product mode.
+     * 显式 Vulcan 托管产品模式。 */
+    bool vulcan_managed;
 } cbm_daemon_host_config_t;
 
 /* Blocks for the complete daemon generation. The first admitted frontend owns

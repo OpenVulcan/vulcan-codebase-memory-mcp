@@ -44,6 +44,11 @@ reference/
 # Local-only scratch / session notes (never pushed)
 private/
 
+# Local execution plans and completion records
+# 本地执行计划与完成记录
+/docs/plan/
+/docs/completed/
+
 # Build artifacts
 build/
 node_modules/

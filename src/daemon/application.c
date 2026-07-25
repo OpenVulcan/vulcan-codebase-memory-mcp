@@ -133,6 +133,10 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    /* Registry-owned background lifetime independent from MCP sessions.
+     * 与 MCP session
+     * 无关的注册表所有后台生命周期。 */
+    bool managed_owner;
     cbm_daemon_application_job_t *next;
 };
 
@@ -166,6 +170,10 @@ struct cbm_daemon_application {
     cbm_daemon_application_worker_ops_t worker_ops;
     cbm_daemon_application_update_ops_t update_ops;
     cbm_project_lock_manager_t *project_locks;
+    /* Shared Vulcan authority, present only in explicit managed mode.
+     *
+     * 仅在显式托管模式存在的共享 Vulcan 权威注册表。 */
+    cbm_managed_project_registry_t *managed_projects;
     size_t physical_job_limit;
     size_t worker_memory_budget_bytes;
     size_t active_mutations;
@@ -181,6 +189,10 @@ struct cbm_daemon_application {
     bool stopping;
     /* See cbm_daemon_application_set_permanent. */
     bool permanent;
+    /* Explicit managed mode copied from daemon host configuration.
+     * 从 daemon host
+     * 配置复制的显式托管模式。 */
+    bool vulcan_managed;
 };
 
 typedef struct {
@@ -203,6 +215,18 @@ static char *application_auto_index_args(const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
     const char *args_json, application_job_subscribe_status_t *status_out);
+/* Schedule one registry-owned index without a session subscriber.
+ * 在没有 session subscriber
+ * 的情况下调度一个注册表所有索引。 */
+static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *context,
+                                                                         const char *project_key,
+                                                                         const char *canonical_root,
+                                                                         bool force);
+/* Register or repair one registry-owned watcher for an exact key/root pair.
+ *
+ * 为精确项目键与根路径组合注册或修复一个注册表所有 watcher。 */
+static bool application_managed_watch_project(void *context, const char *project_key,
+                                              const char *canonical_root);
 
 static atomic_bool g_application_fail_next_job_thread_start_for_test = ATOMIC_VAR_INIT(false);
 
@@ -1104,7 +1128,22 @@ void cbm_daemon_application_project_mutation_end(cbm_daemon_application_t *appli
 }
 
 static bool application_watcher_mutation_begin(void *context, const char *project) {
-    return cbm_daemon_application_project_mutation_try_begin(context, project);
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    if (application && application->vulcan_managed) {
+        /* Managed roots may be temporarily unavailable.
+         * Reject pruning and mark their
+         * registry entries offline.
+         * 托管根路径可能暂时不可用。
+         *
+         * 拒绝清理，并将对应注册表条目标记为离线。 */
+        if (application->managed_projects) {
+            (void)cbm_managed_project_registry_mark_offline(application->managed_projects, project);
+        }
+        return false;
+    }
+    return cbm_daemon_application_project_mutation_try_begin(application, project);
 }
 
 static void application_watcher_mutation_end(void *context, const char *project) {
@@ -1550,6 +1589,62 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
                                !execution->last_result.cancellation_requested);
     job->terminal = true;
     job->thread_done = true;
+    if (job->managed_owner && application->managed_projects) {
+        /* A removed project clears managed_owner before cancellation, so only
+         * the
+         * still-authoritative entry receives this terminal publication.
+         *
+         * 已移除项目会在取消前清除 managed_owner，因此只有仍具权威性的条目接收终态。 */
+        /* Whether the finished job still owns the exact registered key/root.
+         *
+         * 已完成任务是否仍拥有精确注册的项目键与根路径。 */
+        bool authoritative = cbm_managed_project_registry_contains(
+            application->managed_projects, job->project_key, job->root_path);
+        /* Whether the terminal result reached the authoritative entry.
+         *
+         * 终态结果是否已发布到权威条目。 */
+        bool published =
+            authoritative &&
+            cbm_managed_project_registry_publish_index(
+                application->managed_projects, job->project_key, job->successful, cbm_now_ms(),
+                job->supervision_failed ? "index_supervision_failed" : "index_failed",
+                job->successful ? NULL : "Managed index did not commit");
+        if (published && !cbm_is_dir(job->root_path)) {
+            /*
+             * Preserve a successful revision or failure diagnostic while
+ * making
+             * current filesystem availability authoritative.
+             *
+             *
+             * 保留成功修订号或失败诊断，同时以当前文件系统可用性作为权威状态。
+
+             */
+            (void)cbm_managed_project_registry_mark_offline(application->managed_projects,
+                                                            job->project_key);
+        } else if (published && job->successful) {
+            /* Register the watcher only after a usable database generation is
+             *
+
+             * * published, preventing queries from observing a ghost project.
+             *
+
+             * * 仅在可用数据库 generation 发布后注册 watcher，避免查询观察到幽灵项目。 */
+            bool watched =
+                application_managed_watch_project(application, job->project_key, job->root_path);
+            if (!watched && cbm_managed_project_registry_contains(
+                                application->managed_projects, job->project_key, job->root_path)) {
+                if (!cbm_is_dir(job->root_path)) {
+                    (void)cbm_managed_project_registry_mark_offline(application->managed_projects,
+                                                                    job->project_key);
+                } else {
+                    (void)cbm_managed_project_registry_publish_index(
+                        application->managed_projects, job->project_key, false, cbm_now_ms(),
+                        "watch_registration_failed", "Managed watcher registration failed");
+                }
+            }
+        }
+        job->managed_owner = false;
+    }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         if (session->auto_index_job != job || !session->auto_index_subscribed) {
@@ -2340,6 +2435,252 @@ static char *application_index_execute(void *context, const char *root_path,
     return application_job_wait_for_session(session, job);
 }
 
+/* Build canonical full-index arguments for a managed project.
+ *
+ * 为托管项目构建规范化全量索引参数。
+ *
+ * Parameters:
+ * - project_key:
+ * authoritative
+ * CBM storage key.
+ * - canonical_root: authoritative filesystem root.
+ * 参数：
+ * -
+ * project_key：权威 CBM
+ * 存储键。
+ * - canonical_root：权威文件系统根路径。
+ *
+ * Returns caller-owned JSON
+ * or NULL on allocation failure.
+ * 返回调用方拥有的 JSON；分配失败时返回 NULL。
+
+ */
+static char *application_managed_index_args(const char *project_key, const char *canonical_root) {
+    if (!project_key || !project_key[0] || !canonical_root || !canonical_root[0]) {
+        return NULL;
+    }
+    /* Mutable JSON document.
+     * 可变 JSON 文档。 */
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    /* Mutable argument root.
+     * 可变参数根对象。 */
+    yyjson_mut_val *root = document ? yyjson_mut_obj(document) : NULL;
+    if (!document || !root) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(document, root);
+    /* Whether every argument was encoded.
+     * 是否所有参数均已编码。 */
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root);
+    /* Default key derived by upstream indexing.
+     * 上游索引派生的默认键。 */
+    char *default_project = cbm_project_name_from_path(canonical_root);
+    if (encoded && (!default_project || strcmp(default_project, project_key) != 0)) {
+        encoded = yyjson_mut_obj_add_strcpy(document, root, "name", project_key);
+    }
+    free(default_project);
+    /* Serialized argument object.
+     * 序列化参数对象。 */
+    char *arguments = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
+    yyjson_mut_doc_free(document);
+    return arguments;
+}
+
+/* Register or repair one registry-owned physical watcher.
+ *
+ * 注册或修复一个注册表所有的物理 watcher。
+ *
+ * Returns true only for an
+ * authoritative
+ * registered key/root pair.
+ * 仅对已注册的权威项目键与根路径组合返回 true。
+
+ */
+static bool application_managed_watch_project(void *context, const char *project_key,
+                                              const char *canonical_root) {
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    if (!application || !application->vulcan_managed || !application->managed_projects ||
+        !application->watcher ||
+        !cbm_managed_project_registry_contains(application->managed_projects, project_key,
+                                               canonical_root)) {
+        return false;
+    }
+    /* Current root filesystem state.
+     * 当前根路径文件系统状态。 */
+    struct stat root_status;
+    if (stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        (void)cbm_managed_project_registry_mark_offline(application->managed_projects, project_key);
+        return false;
+    }
+    /* Physical watcher registration result.
+     * 物理 watcher 注册结果。 */
+    bool registered = cbm_watcher_watch(application->watcher, project_key, canonical_root);
+    (void)cbm_managed_project_registry_set_watcher(application->managed_projects, project_key,
+                                                   registered);
+    return registered;
+}
+
+/* Remove one registry-owned watcher without deleting project storage.
+ *
+ * 移除一个注册表所有 watcher，但不删除项目存储。
+ */
+static void application_managed_unwatch_project(void *context, const char *project_key) {
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    if (!application || !application->vulcan_managed || !project_key) {
+        return;
+    }
+    if (application->watcher) {
+        cbm_watcher_unwatch(application->watcher, project_key);
+    }
+    if (application->managed_projects) {
+        (void)cbm_managed_project_registry_set_watcher(application->managed_projects, project_key,
+                                                       false);
+    }
+}
+
+/* Schedule one registry-owned physical index while preserving bounded
+ * daemon-wide concurrency.
+
+ * * 在保持 daemon 全局并发有界的同时调度一个注册表所有物理索引。
+ */
+static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *context,
+                                                                         const char *project_key,
+                                                                         const char *canonical_root,
+                                                                         bool force) {
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    (void)force;
+    if (!application || !application->vulcan_managed || !application->managed_projects ||
+        !project_key || !canonical_root ||
+        !cbm_managed_project_registry_contains(application->managed_projects, project_key,
+                                               canonical_root)) {
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
+    /* Canonical index arguments.
+     * 规范化索引参数。 */
+    char *arguments = application_managed_index_args(project_key, canonical_root);
+    if (!arguments) {
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
+
+    /* Physical job selected or created by the shared coordinator.
+     *
+     * 共享协调器选择或创建的物理任务。 */
+    /* Last admission status.
+     * 最近一次准入状态。 */
+    application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
+    /* Whether this call created the physical job.
+     * 本次调用是否创建了物理任务。
+     */
+    bool started = false;
+    for (;;) {
+        application_jobs_reap_completed(application);
+        cbm_mutex_lock(&application->mutex);
+        /*
+         * Revalidate under the application lock so a removal that completed
+         *
+         * after the initial admission check cannot slip past cancel_index
+         * before this
+         * job exists.
+         *
+         * 在 application
+         * 锁内再次验证，避免项目在首次准入检查后完成移除，
+         * 且
+         * cancel_index 早于任务创建，从而让失去权威的任务漏过取消。
+ */
+        if (!cbm_managed_project_registry_contains(application->managed_projects, project_key,
+                                                   canonical_root)) {
+            cbm_mutex_unlock(&application->mutex);
+            free(arguments);
+            return CBM_MCP_MANAGED_INDEX_FAILED;
+        }
+        /* Active job before the subscription attempt.
+         * 订阅尝试前的活动任务。
+
+         */
+        cbm_daemon_application_job_t *existing =
+            application_find_active_job_locked(application, project_key);
+        /* Physical job selected or created by the shared coordinator.
+         *
+         * 共享协调器选择或创建的物理任务。 */
+        cbm_daemon_application_job_t *job = application_job_subscribe_locked(
+            application, project_key, canonical_root, arguments, &subscribe_status);
+        if (job) {
+            started = existing == NULL;
+            /* Transfer the temporary ordinary subscription to the registry.
+             *
+             * 将临时普通订阅转移给注册表。 */
+            if (!job->managed_owner) {
+                job->managed_owner = true;
+            }
+            if (job->subscribers > 0U) {
+                job->subscribers--;
+            }
+            cbm_mutex_unlock(&application->mutex);
+            break;
+        }
+        /* Whether the bounded queue may keep waiting.
+         *
+         * 有界队列是否可以继续等待。
+         */
+        bool retry = !application->stopping &&
+                     (subscribe_status == APPLICATION_JOB_SUBSCRIBE_BUSY ||
+                      subscribe_status == APPLICATION_JOB_SUBSCRIBE_CANCELLING) &&
+                     cbm_managed_project_registry_contains(application->managed_projects,
+                                                           project_key, canonical_root);
+        cbm_mutex_unlock(&application->mutex);
+        if (!retry) {
+            free(arguments);
+            return CBM_MCP_MANAGED_INDEX_FAILED;
+        }
+        cbm_usleep(APPLICATION_JOB_POLL_US);
+    }
+    free(arguments);
+    (void)cbm_managed_project_registry_mark_indexing(application->managed_projects, project_key);
+    return started ? CBM_MCP_MANAGED_INDEX_STARTED : CBM_MCP_MANAGED_INDEX_RUNNING;
+}
+
+/* Cancel only the registry-owned claim for a removed managed project.
+ *
+ * 仅取消已移除托管项目的注册表所有权声明。
+ */
+static void application_managed_cancel_index(void *context, const char *project_key) {
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    if (!application || !application->vulcan_managed || !project_key) {
+        return;
+    }
+    cbm_mutex_lock(&application->mutex);
+    /* Active physical job for the project.
+     * 项目的活动物理任务。 */
+    cbm_daemon_application_job_t *job =
+        application_find_active_job_locked(application, project_key);
+    if (job && job->managed_owner) {
+        job->managed_owner = false;
+        if (job->subscribers == 0U && job->watcher_waiters == 0U && !job->terminal) {
+            job->cancel_requested = true;
+        }
+    }
+    cbm_mutex_unlock(&application->mutex);
+}
+
+/* Shared callback table borrowed by every managed MCP session.
+ * 每个托管 MCP session
+ * 借用的共享回调表。 */
+static const cbm_mcp_managed_ops_t APPLICATION_MANAGED_OPS = {
+    .watch_project = application_managed_watch_project,
+    .unwatch_project = application_managed_unwatch_project,
+    .schedule_index = application_managed_schedule_index,
+    .cancel_index = application_managed_cancel_index,
+};
+
 static cbm_daemon_runtime_application_session_t *application_session_open(
     void *context, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id) {
     cbm_daemon_application_t *application = context;
@@ -2362,6 +2703,10 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
                                               application_session_mutation_end, session);
+    if (application->vulcan_managed && application->managed_projects) {
+        cbm_mcp_server_set_vulcan_managed(session->mcp, application->managed_projects,
+                                          &APPLICATION_MANAGED_OPS, application);
+    }
     session->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     session->application = application;
     session->client_id = client_id;
@@ -2395,7 +2740,9 @@ static cbm_daemon_runtime_application_status_t application_set_context(
                         event_length + dialect_length;
     if (request[5] > 1 || root_length == 0 || expected != request_length ||
         (!allowed_present && allowed_length != 0) ||
-        profile_value > (uint8_t)CBM_MCP_TOOL_PROFILE_SCOUT ||
+        profile_value > (uint8_t)CBM_MCP_TOOL_PROFILE_VULCAN ||
+        ((profile_value == (uint8_t)CBM_MCP_TOOL_PROFILE_VULCAN) !=
+         session->application->vulcan_managed) ||
         (profile_value != (uint8_t)CBM_MCP_TOOL_PROFILE_ALL &&
          (event_length != 0 || dialect_length != 0))) {
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
@@ -2853,6 +3200,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         application->watcher = config->watcher;
         application->config = config->config;
         application->project_locks = config->project_locks;
+        application->vulcan_managed = config->vulcan_managed;
         if (config->physical_job_limit > 0) {
             application->physical_job_limit = config->physical_job_limit;
         }
@@ -2864,6 +3212,14 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         }
         if (config->update_ops) {
             application->update_ops = *config->update_ops;
+        }
+    }
+    if (application->vulcan_managed) {
+        application->managed_projects = cbm_managed_project_registry_new();
+        if (!application->managed_projects) {
+            cbm_mutex_destroy(&application->mutex);
+            free(application);
+            return NULL;
         }
     }
     /* Equal fixed slices keep admission deterministic: starting fewer jobs does
@@ -2890,6 +3246,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     }
     if (!application->worker_ops.poll || !application->worker_ops.cancel ||
         !application->worker_ops.log_path || !application->worker_ops.destroy) {
+        cbm_managed_project_registry_free(application->managed_projects);
         cbm_mutex_destroy(&application->mutex);
         free(application);
         return NULL;
@@ -2905,6 +3262,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     }
     if (!application->update_ops.poll || !application->update_ops.cancel ||
         !application->update_ops.destroy) {
+        cbm_managed_project_registry_free(application->managed_projects);
         cbm_mutex_destroy(&application->mutex);
         free(application);
         return NULL;
@@ -3040,6 +3398,8 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
         free(mutations);
         mutations = next;
     }
+    cbm_managed_project_registry_free(application->managed_projects);
+    application->managed_projects = NULL;
     cbm_mutex_destroy(&application->mutex);
     free(application);
     return true;
@@ -3130,7 +3490,7 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_contex
     size_t dialect_length = hook_dialect ? strlen(hook_dialect) : 0;
     uint64_t total = (uint64_t)APPLICATION_CONTEXT_HEADER_SIZE + root_length + allowed_length +
                      event_length + dialect_length;
-    if (tool_profile < CBM_MCP_TOOL_PROFILE_ALL || tool_profile > CBM_MCP_TOOL_PROFILE_SCOUT ||
+    if (tool_profile < CBM_MCP_TOOL_PROFILE_ALL || tool_profile > CBM_MCP_TOOL_PROFILE_VULCAN ||
         (tool_profile != CBM_MCP_TOOL_PROFILE_ALL && (event_length != 0 || dialect_length != 0)) ||
         !cbm_hook_augment_invocation_supported(hook_event, hook_dialect) ||
         root_length > UINT32_MAX || allowed_length > UINT32_MAX || event_length > UINT32_MAX ||
@@ -3401,7 +3761,45 @@ int cbm_daemon_application_index(cbm_daemon_application_t *application, const ch
 
 int cbm_daemon_application_watcher_index(const char *project_name, const char *root_path,
                                          void *context) {
-    return application_background_index(context, project_name, root_path, true);
+    /* Owning daemon application.
+     * 所属 daemon application。 */
+    cbm_daemon_application_t *application = context;
+    if (application && application->vulcan_managed) {
+        if (!application->managed_projects ||
+            !cbm_managed_project_registry_contains(application->managed_projects, project_name,
+                                                   root_path)) {
+            return 1;
+        }
+        /* Managed watcher work is owned by the registry, never by a live
+         * session
+         * subscription. It may safely finish after every session exits.
+         * 托管 watcher
+         * 工作由注册表拥有，绝不由 live session 订阅拥有。 */
+        cbm_mcp_managed_index_status_t scheduled =
+            application_managed_schedule_index(application, project_name, root_path, false);
+        if (scheduled == CBM_MCP_MANAGED_INDEX_FAILED) {
+            return 1;
+        }
+        for (;;) {
+            cbm_managed_project_entry_t project = {0};
+            if (!cbm_managed_project_registry_get_by_key(application->managed_projects,
+                                                         project_name, &project)) {
+                return 1;
+            }
+            if (project.lifecycle != CBM_MANAGED_PROJECT_INDEXING) {
+                return project.lifecycle == CBM_MANAGED_PROJECT_READY ? 0 : 1;
+            }
+            cbm_mutex_lock(&application->mutex);
+            bool stopping = application->stopping;
+            cbm_mutex_unlock(&application->mutex);
+            if (stopping) {
+                return 1;
+            }
+            application_jobs_reap_completed(application);
+            cbm_usleep(APPLICATION_JOB_POLL_US);
+        }
+    }
+    return application_background_index(application, project_name, root_path, true);
 }
 
 size_t cbm_daemon_application_active_jobs(cbm_daemon_application_t *application) {
@@ -3449,6 +3847,20 @@ size_t cbm_daemon_application_worker_memory_budget_bytes(cbm_daemon_application_
     size_t budget = application->worker_memory_budget_bytes;
     cbm_mutex_unlock(&application->mutex);
     return budget;
+}
+
+size_t cbm_daemon_application_managed_project_count(cbm_daemon_application_t *application) {
+    if (!application || !application->managed_projects) {
+        return 0U;
+    }
+    return cbm_managed_project_registry_count(application->managed_projects);
+}
+
+uint64_t cbm_daemon_application_managed_generation(cbm_daemon_application_t *application) {
+    if (!application || !application->managed_projects) {
+        return 0U;
+    }
+    return cbm_managed_project_registry_generation(application->managed_projects);
 }
 
 bool cbm_daemon_application_session_retains_store_for_test(

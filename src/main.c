@@ -84,6 +84,12 @@ enum {
 #define CBM_VERSION "dev"
 #endif
 
+#ifdef CBM_VULCAN_PRODUCT
+#define CBM_PRODUCT_NAME "vulcan-codebase-memory-mcp"
+#else
+#define CBM_PRODUCT_NAME "codebase-memory-mcp"
+#endif
+
 /* ── Globals for signal handling ────────────────────────────────── */
 
 static atomic_int g_shutdown = 0;
@@ -514,6 +520,44 @@ static bool cli_strip_flag(int *argc, char **argv, const char *flag) {
     return false;
 }
 
+/*
+ * Count an exact process argument without interpreting aliases.
+ *
+ * 统计精确进程参数，且不解释任何别名。
+ */
+static int main_count_exact_arg(int argc, char **argv, const char *expected) {
+    int count = 0;
+    for (int index = 1; argv && index < argc; index++) {
+        if (argv[index] && strcmp(argv[index], expected) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/*
+ * Configure the storage root dedicated to the Vulcan-managed product.
+ * 配置 Vulcan
+ * 托管产品专用的存储根目录。
+ */
+static bool main_configure_vulcan_cache(void) {
+    char configured[MAIN_PATH_CAP];
+    const char *override =
+        cbm_safe_getenv("VULCAN_CBM_CACHE_DIR", configured, sizeof(configured), NULL);
+    char derived[MAIN_PATH_CAP];
+    const char *selected = override;
+    if (!selected || !selected[0]) {
+        const char *home = cbm_get_home_dir();
+        if (!home || !home[0] ||
+            snprintf(derived, sizeof(derived), "%s/.cache/vulcan-codebase-memory-mcp", home) >=
+                (int)sizeof(derived)) {
+            return false;
+        }
+        selected = derived;
+    }
+    return cbm_setenv("CBM_CACHE_DIR", selected, 1) == 0;
+}
+
 /* Strip a flag AND its following value from argv, returning the value (a pointer
  * into the original argv strings, valid for the process lifetime) or NULL if the
  * flag is absent. */
@@ -613,6 +657,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
      * the given file for the parent to read back. Stripped here so the tool
      * dispatch below sees only the tool name + its args. */
     bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
+    (void)cli_strip_flag(&argc, argv, CBM_INDEX_WORKER_VULCAN_MANAGED_ARG);
     (void)cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_BUILD_ARG);
     const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
     (void)cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MEMORY_BUDGET_ARG);
@@ -815,7 +860,16 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
 /* ── Help ───────────────────────────────────────────────────────── */
 
 static void print_help(void) {
-    printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
+    printf("%s %s\n\n", CBM_PRODUCT_NAME, CBM_VERSION);
+#ifdef CBM_VULCAN_PRODUCT
+    printf("Usage:\n");
+    printf("  vulcan-codebase-memory-mcp [--vulcan-managed]\n");
+    printf("                                      Run the Vulcan-managed MCP server\n");
+    printf("  vulcan-codebase-memory-mcp --version\n");
+    printf("  vulcan-codebase-memory-mcp --help\n");
+    printf("\nThis binary implements only the Vulcan private managed MCP contract.\n");
+    return;
+#endif
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli [--progress] [--json] <tool> [args]\n");
@@ -867,7 +921,7 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
     }
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
-            printf("codebase-memory-mcp %s\n", CBM_VERSION);
+            printf("%s %s\n", CBM_PRODUCT_NAME, CBM_VERSION);
             return 0;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1730,6 +1784,50 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
         return EXIT_FAILURE;
     }
+    int public_managed_args = main_count_exact_arg(argc, argv, "--vulcan-managed");
+    bool internal_vulcan_managed = role == CBM_DAEMON_PROCESS_DAEMON && argc == 3 &&
+                                   strcmp(argv[2], CBM_DAEMON_VULCAN_MANAGED_ARG) == 0;
+    bool worker_vulcan_managed =
+        role == CBM_DAEMON_PROCESS_WORKER &&
+        main_count_exact_arg(argc, argv, CBM_INDEX_WORKER_VULCAN_MANAGED_ARG) == 1;
+#ifdef CBM_VULCAN_PRODUCT
+    /*
+     * The dedicated distribution has no public/general MCP mode. The explicit
+     * flag
+     * remains accepted for the host launch contract, while a bare launch
+     * is the same managed
+     * product for direct protocol diagnostics.
+     * 专版不提供公共或通用 MCP
+     * 模式；显式参数继续服务宿主启动契约，而无参数启动
+     *
+     * 同样进入托管产品，便于直接执行协议诊断。
+     */
+    bool public_vulcan_managed = role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
+                                 (argc == 1 || (argc == 2 && public_managed_args == 1));
+    bool dedicated_stateless = role == CBM_DAEMON_PROCESS_STATELESS && argc == 2 &&
+                               (strcmp(argv[1], "--version") == 0 ||
+                                strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0);
+    bool dedicated_role = public_vulcan_managed || internal_vulcan_managed ||
+                          worker_vulcan_managed || dedicated_stateless;
+    if (!dedicated_role) {
+        (void)fprintf(stderr, "vulcan-codebase-memory-mcp: only the Vulcan managed MCP contract is "
+                              "supported\n");
+        return EXIT_FAILURE;
+    }
+#else
+    bool public_vulcan_managed =
+        role == CBM_DAEMON_PROCESS_MCP_CLIENT && argc == 2 && public_managed_args == 1;
+    if (public_managed_args > 0 && !public_vulcan_managed) {
+        (void)fprintf(stderr, "codebase-memory-mcp: --vulcan-managed is a dedicated MCP mode and "
+                              "cannot be combined with other commands or flags\n");
+        return EXIT_FAILURE;
+    }
+#endif
+    bool vulcan_managed = public_vulcan_managed || internal_vulcan_managed || worker_vulcan_managed;
+    if (vulcan_managed && !main_configure_vulcan_cache()) {
+        (void)fprintf(stderr, "vulcan-codebase-memory-mcp: dedicated cache configuration failed\n");
+        return EXIT_FAILURE;
+    }
 #ifndef _WIN32
     if (role == CBM_DAEMON_PROCESS_DAEMON) {
         (void)umask(077);
@@ -1741,8 +1839,11 @@ int main(int argc, char **argv) {
     cbm_log_init_from_env();
 
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
-    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
-        cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
+    if (public_vulcan_managed) {
+        tool_profile = CBM_MCP_TOOL_PROFILE_VULCAN;
+    } else if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
+               cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) !=
+                   0) {
         (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
                               "'analysis' or 'scout'\n");
         return 2;
@@ -1938,7 +2039,8 @@ int main(int argc, char **argv) {
                           cbm_index_worker_argv_status_message(worker_status));
             return EXIT_FAILURE;
         }
-        cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *worker_endpoint =
+            cbm_daemon_bootstrap_endpoint_new_for_product(NULL, invocation.vulcan_managed);
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;
         cbm_version_cohort_manager_t *worker_cohort_manager =
@@ -2028,6 +2130,7 @@ int main(int argc, char **argv) {
             _exit(EXIT_FAILURE);
         }
 #endif
+        cbm_index_supervisor_set_vulcan_managed(invocation.vulcan_managed);
         cbm_index_supervisor_mark_host();
         result = handle_subcommand(argc, argv, worker_project_locks, &worker_maintenance_context);
 
@@ -2049,7 +2152,8 @@ int main(int argc, char **argv) {
         return result;
     }
 
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_bootstrap_endpoint_new_for_product(NULL, vulcan_managed);
     if (!endpoint) {
         (void)fprintf(stderr, "codebase-memory-mcp: secure daemon endpoint could not be created\n");
         return EXIT_FAILURE;
@@ -2063,14 +2167,17 @@ int main(int argc, char **argv) {
 
     if (role == CBM_DAEMON_PROCESS_DAEMON) {
         setup_signal_handlers();
+        cbm_index_supervisor_set_vulcan_managed(internal_vulcan_managed);
+        cbm_index_supervisor_mark_host();
         cbm_daemon_host_config_t host_config = {
             .endpoint = endpoint,
             .identity = identity,
             .executable_path = executable_path,
             .stop_requested = &g_shutdown,
-            /* The role classifier already enforced the byte-exact grammar:
-             * argc==3 can only be the permanent spawn shape. */
-            .permanent = argc == 3,
+            /* The role classifier already enforced the byte-exact grammar.
+             * Only the explicit permanent marker creates a permanent generation. */
+            .permanent = argc == 3 && strcmp(argv[2], CBM_DAEMON_PERMANENT_ARG) == 0,
+            .vulcan_managed = internal_vulcan_managed,
         };
         int result = cbm_daemon_host_run(&host_config);
         cbm_daemon_ipc_endpoint_free(endpoint);
@@ -2135,6 +2242,8 @@ int main(int argc, char **argv) {
         .executable_path = executable_path,
         .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
         .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
+        .spawn_permanent = false,
+        .vulcan_managed = public_vulcan_managed,
     };
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =

@@ -141,15 +141,19 @@ static void digest_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
     out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
-bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]) {
+bool cbm_daemon_rendezvous_key_for_product(bool vulcan_managed, char out[CBM_DAEMON_KEY_SIZE]) {
     if (!out) {
         return false;
     }
     /* This product-domain string is intentionally the only key input. Account
      * isolation comes from the authenticated IPC runtime, not spoofable text. */
-    static const unsigned char domain[] = "codebase-memory-mcp:coordination-daemon";
+    static const unsigned char public_domain[] = "codebase-memory-mcp:coordination-daemon";
+    static const unsigned char managed_domain[] = "vulcan-codebase-memory-mcp:coordination-daemon";
+    const unsigned char *domain = vulcan_managed ? managed_domain : public_domain;
+    size_t domain_length =
+        vulcan_managed ? sizeof(managed_domain) - 1U : sizeof(public_domain) - 1U;
     uint64_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < sizeof(domain) - 1; i++) {
+    for (size_t i = 0; i < domain_length; i++) {
         hash ^= domain[i];
         hash *= 1099511628211ULL;
     }
@@ -159,6 +163,10 @@ bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]) {
         return false;
     }
     return true;
+}
+
+bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]) {
+    return cbm_daemon_rendezvous_key_for_product(false, out);
 }
 
 cbm_daemon_hello_status_t cbm_daemon_hello_compare(const cbm_daemon_build_identity_t *active,

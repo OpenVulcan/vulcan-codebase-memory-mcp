@@ -42,6 +42,7 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
+#include "daemon/managed_project_registry.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -60,6 +61,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/limits.h"
 #include "foundation/subprocess.h"
+#include "foundation/sha256.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/compact_out.h"
 #include "foundation/str_util.h"
@@ -545,7 +547,8 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"project\"]}"},
 
     {"search_code", "Search code",
-     "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
+     "Graph-augmented code search. Finds text patterns with an in-process source scan, then "
+     "enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
      "importance (definitions first, popular functions next, tests last). "
      "Modes: compact (default, signatures only — token efficient), full (source capped at a "
@@ -557,13 +560,13 @@ static const tool_def_t TOOLS[] = {
      "count) — compare to limit to detect truncation. There is no offset parameter; to see "
      "more, raise limit or narrow the query with file_pattern / path_filter.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
-     "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
-     "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
+     "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for source "
+     "file basenames (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
      "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\",\"description\":\"compact: "
      "signatures+metadata (default). full: with source. files: just file list.\"},"
      "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
-     "(like grep -C). Only used in compact mode.\"},"
+     "(like a context search). Only used in compact mode.\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
@@ -651,6 +654,42 @@ static const tool_def_t TOOLS[] = {
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
      "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"vulcan_sync_projects", "Synchronize Vulcan projects",
+     "Replace the complete authoritative set of Vulcan-managed projects. "
+     "The generation must increase strictly. Removed projects are unwatched "
+     "without deleting databases or graph artifacts.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\","
+     "\"description\":\"Private Vulcan managed-service contract.\"},"
+     "\"generation\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"description\":\"Strictly increasing authoritative generation.\"},"
+     "\"projects\":{\"type\":\"array\",\"maxItems\":4096,\"items\":{"
+     "\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+     "\"project_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":255,"
+     "\"description\":\"Stable Vulcan project identifier.\"},"
+     "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095,"
+     "\"description\":\"Absolute project root path.\"}},"
+     "\"required\":[\"project_id\",\"pwd\"]}}},"
+     "\"required\":[\"contract\",\"generation\",\"projects\"]}"},
+
+    {"vulcan_project_status", "Read Vulcan project status",
+     "Return lifecycle, watcher, index revision, graph counts, and the latest "
+     "bounded error for one registered Vulcan project.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\"},"
+     "\"project_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":255},"
+     "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095}},"
+     "\"required\":[\"contract\",\"project_id\",\"pwd\"]}"},
+
+    {"vulcan_reindex_project", "Reindex Vulcan project",
+     "Schedule a full index for one registered Vulcan project. An existing "
+     "physical job is returned instead of starting a duplicate.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\"},"
+     "\"project_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":255},"
+     "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095}},"
+     "\"required\":[\"contract\",\"project_id\",\"pwd\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -683,6 +722,9 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
+    {"vulcan_sync_projects", false, false, false, false},
+    {"vulcan_project_status", true, false, true, false},
+    {"vulcan_reindex_project", false, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -707,13 +749,59 @@ static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const 
     }
 }
 
-static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) {
+/*
+ * Remove host-injected project routing from schemas shown to the model.
+ *
+ * 从模型可见的参数结构中移除由宿主注入的项目路由字段。
+ */
+static void mcp_hide_managed_project_argument(yyjson_mut_val *schema) {
+    if (!schema || !yyjson_mut_is_obj(schema)) {
+        return;
+    }
+    yyjson_mut_val *properties = yyjson_mut_obj_get(schema, "properties");
+    if (properties && yyjson_mut_is_obj(properties)) {
+        yyjson_mut_obj_remove_str(properties, "project");
+    }
+    yyjson_mut_val *required = yyjson_mut_obj_get(schema, "required");
+    if (!required || !yyjson_mut_is_arr(required)) {
+        return;
+    }
+    size_t index = 0U;
+    while (index < yyjson_mut_arr_size(required)) {
+        yyjson_mut_val *item = yyjson_mut_arr_get(required, index);
+        if (item && yyjson_mut_is_str(item) && strcmp(yyjson_mut_get_str(item), "project") == 0) {
+            yyjson_mut_arr_remove(required, index);
+            continue;
+        }
+        index++;
+    }
+}
+
+/*
+ * Add one profile-aware MCP tool definition.
+ * 添加一个根据工具配置投影后的 MCP
+ * 工具定义。
+
+ */
+static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i,
+                             cbm_mcp_tool_profile_t profile) {
     yyjson_mut_val *tool = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
     yyjson_mut_obj_add_str(doc, tool, "title", TOOLS[i].title);
     yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
 
-    mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
+    yyjson_doc *schema_doc = yyjson_read(TOOLS[i].input_schema, strlen(TOOLS[i].input_schema), 0);
+    if (schema_doc) {
+        yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
+        if (profile == CBM_MCP_TOOL_PROFILE_VULCAN &&
+            strncmp(TOOLS[i].name, "vulcan_", strlen("vulcan_")) != 0) {
+            mcp_hide_managed_project_argument(schema);
+        }
+        if (schema) {
+            yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
+        }
+        yyjson_doc_free(schema_doc);
+    }
     mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
 
     const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
@@ -737,11 +825,26 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
         "list_projects", "index_status", "check_index_coverage",
     };
+    static const char *const vulcan_tools[] = {
+        "search_graph",
+        "query_graph",
+        "trace_path",
+        "get_code_snippet",
+        "get_graph_schema",
+        "get_architecture",
+        "search_code",
+        "index_status",
+        "check_index_coverage",
+        "detect_changes",
+        "vulcan_sync_projects",
+        "vulcan_project_status",
+        "vulcan_reindex_project",
+    };
     if (!name) {
         return false;
     }
     if (profile == CBM_MCP_TOOL_PROFILE_ALL) {
-        return true;
+        return strncmp(name, "vulcan_", strlen("vulcan_")) != 0;
     }
     const char *const *allowed = NULL;
     size_t allowed_count = 0U;
@@ -751,6 +854,9 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
         allowed = scout_tools;
         allowed_count = sizeof(scout_tools) / sizeof(scout_tools[0]);
+    } else if (profile == CBM_MCP_TOOL_PROFILE_VULCAN) {
+        allowed = vulcan_tools;
+        allowed_count = sizeof(vulcan_tools) / sizeof(vulcan_tools[0]);
     }
     for (size_t i = 0U; i < allowed_count; i++) {
         if (strcmp(name, allowed[i]) == 0) {
@@ -761,7 +867,16 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
 }
 
 static const char *mcp_tool_profile_name(cbm_mcp_tool_profile_t profile) {
-    return profile == CBM_MCP_TOOL_PROFILE_SCOUT ? "scout" : "analysis";
+    if (profile == CBM_MCP_TOOL_PROFILE_ALL) {
+        return "all";
+    }
+    if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
+        return "scout";
+    }
+    if (profile == CBM_MCP_TOOL_PROFILE_VULCAN) {
+        return "vulcan";
+    }
+    return "analysis";
 }
 
 int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
@@ -848,7 +963,7 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_tool_profile_t profile, int offset
             continue;
         }
         if (visible >= offset) {
-            mcp_add_tool_def(doc, tools, i);
+            mcp_add_tool_def(doc, tools, i, profile);
         }
         visible++;
     }
@@ -1149,6 +1264,12 @@ static const char MCP_SCOUT_SERVER_INSTRUCTIONS[] =
     "are provisional: do not make absence, exhaustive-impact, or dead-code claims. If the project "
     "is missing or stale, ask the parent agent to index or refresh it.";
 
+static const char MCP_VULCAN_SERVER_INSTRUCTIONS[] =
+    "This server is managed by Vulcan Code. Project identity and working-directory context are "
+    "injected by the host and are not model-controlled. Use only the project-scoped read tools "
+    "advertised by this session. Project synchronization, status, and reindex controls are "
+    "reserved for the trusted Vulcan host.";
+
 static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
                                                      cbm_mcp_tool_profile_t profile) {
     /* Determine protocol version: if client requests a version we support,
@@ -1178,8 +1299,16 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     yyjson_mut_obj_add_str(doc, root, "protocolVersion", version);
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
+    yyjson_mut_obj_add_str(doc, impl, "name",
+                           profile == CBM_MCP_TOOL_PROFILE_VULCAN ? "vulcan-codebase-memory-mcp"
+                                                                  : "codebase-memory-mcp");
     yyjson_mut_obj_add_str(doc, impl, "version", cbm_cli_get_version());
+    if (profile == CBM_MCP_TOOL_PROFILE_VULCAN) {
+        yyjson_mut_obj_add_str(doc, impl, "managedBy", "vulcan-code");
+        yyjson_mut_obj_add_str(doc, impl, "contract", CBM_VULCAN_MANAGED_CONTRACT);
+        yyjson_mut_obj_add_str(doc, impl, "buildVersion", cbm_cli_get_version());
+        yyjson_mut_obj_add_uint(doc, impl, "coordinationAbi", CBM_VULCAN_COORDINATION_ABI);
+    }
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
@@ -1195,6 +1324,8 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
         instructions = MCP_ANALYSIS_SERVER_INSTRUCTIONS;
     } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
         instructions = MCP_SCOUT_SERVER_INSTRUCTIONS;
+    } else if (profile == CBM_MCP_TOOL_PROFILE_VULCAN) {
+        instructions = MCP_VULCAN_SERVER_INSTRUCTIONS;
     }
     yyjson_mut_obj_add_str(doc, root, "instructions", instructions);
 
@@ -1473,6 +1604,19 @@ struct cbm_mcp_server {
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
     cbm_mcp_tool_profile_t tool_profile;
+    /* Shared daemon-level Vulcan project authority.
+     * 共享的 daemon 级 Vulcan
+     * 项目权威注册表。
+     */
+    cbm_managed_project_registry_t *managed_projects;
+    /* Borrowed daemon side-effect callbacks for registry transitions.
+     *
+     * 注册表转换使用的借用 daemon 副作用回调。 */
+    const cbm_mcp_managed_ops_t *managed_ops;
+    /* Opaque callback owner, normally the daemon application.
+     *
+     * 不透明回调所有者，通常为 daemon application。 */
+    void *managed_ops_context;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -1502,6 +1646,17 @@ void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile
     if (srv) {
         srv->tool_profile = profile;
     }
+}
+
+void cbm_mcp_server_set_vulcan_managed(cbm_mcp_server_t *srv,
+                                       cbm_managed_project_registry_t *registry,
+                                       const cbm_mcp_managed_ops_t *operations, void *context) {
+    if (!srv) {
+        return;
+    }
+    srv->managed_projects = registry;
+    srv->managed_ops = operations;
+    srv->managed_ops_context = context;
 }
 
 cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
@@ -1975,6 +2130,12 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
+    if (srv->managed_projects) {
+        cbm_managed_project_entry_t managed = {0};
+        if (!cbm_managed_project_registry_get_by_key(srv->managed_projects, project, &managed)) {
+            return NULL;
+        }
+    }
 
     srv->store_last_used = time(NULL);
 
@@ -2055,7 +2216,7 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
      * cache dir for the db whose sole internal project name equals `project` and
      * adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
      * No match → NULL (a genuine typo stays not-found). */
-    cbm_store_t *scanned = resolve_store_fallback_scan(project);
+    cbm_store_t *scanned = srv->managed_projects ? NULL : resolve_store_fallback_scan(project);
     if (scanned) {
         srv->store = scanned;
         srv->owns_store = true;
@@ -6500,6 +6661,13 @@ static char *project_root_from_store(cbm_store_t *store, const char *project) {
 }
 
 static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
+    if (srv && srv->managed_projects && project) {
+        cbm_managed_project_entry_t managed = {0};
+        if (cbm_managed_project_registry_get_by_key(srv->managed_projects, project, &managed)) {
+            return heap_strdup(managed.canonical_root);
+        }
+        return NULL;
+    }
     return project_root_from_store(resolve_store(srv, project), project);
 }
 
@@ -8349,78 +8517,250 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
-/* Build the grep/search command string based on scoped vs recursive mode.
- * On Windows, uses PowerShell Select-String with tab-delimited output.
- * On POSIX, uses grep with colon-delimited output. */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                           const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+/* Match a shell-style file glob without invoking a shell.
+ * Supports '*' for any byte sequence and '?' for one byte. */
+static bool search_glob_match(const char *pattern, const char *text) {
+    const char *star = NULL;
+    const char *retry = NULL;
+    while (*text) {
+        if (*pattern == '?' || *pattern == *text) {
+            pattern++;
+            text++;
+        } else if (*pattern == '*') {
+            star = pattern++;
+            retry = text;
+        } else if (star) {
+            pattern = star + 1;
+            text = ++retry;
+        } else {
+            return false;
+        }
+    }
+    while (*pattern == '*') {
+        pattern++;
+    }
+    return *pattern == '\0';
+}
+
+/* Apply file_pattern to the basename, matching grep --include semantics. */
+static bool search_file_pattern_matches(const char *file_pattern, const char *relative_path) {
+    if (!file_pattern || !file_pattern[0]) {
+        return true;
+    }
+    const char *base = relative_path;
+    for (const char *cursor = relative_path; *cursor; cursor++) {
+        if (*cursor == '/' || *cursor == '\\') {
+            base = cursor + 1;
+        }
+    }
+    return search_glob_match(file_pattern, base);
+}
+
+/* Release a list of heap-owned relative paths. */
+static void free_search_paths(char **paths, int count) {
+    if (!paths) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(paths[i]);
+    }
+    free(paths);
+}
+
+/* Collect indexed source paths, falling back to discovery before the store's
+ * file table has been populated. */
+static char **collect_search_paths(cbm_mcp_server_t *srv, const char *project,
+                                   const char *root_path, int *out_count, bool *out_ok) {
+    *out_count = 0;
+    *out_ok = false;
+
+    cbm_store_t *store = resolve_store(srv, project);
+    char **paths = NULL;
+    int path_count = 0;
+    if (store && cbm_store_list_files(store, project, &paths, &path_count) == CBM_STORE_OK &&
+        path_count > 0) {
+        *out_count = path_count;
+        *out_ok = true;
+        return paths;
+    }
+    free_search_paths(paths, path_count);
+
+    cbm_discover_opts_t options = {
+        .mode = CBM_MODE_FULL,
+        .ignore_file = NULL,
+        .max_file_size = 0,
+    };
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(root_path, &options, &files, &file_count) != 0) {
+        return NULL;
+    }
+
+    if (file_count > 0) {
+        paths = calloc((size_t)file_count, sizeof(char *));
+        if (!paths) {
+            cbm_discover_free(files, file_count);
+            return NULL;
+        }
+        for (int i = 0; i < file_count; i++) {
+            paths[i] = heap_strdup(files[i].rel_path);
+            if (!paths[i]) {
+                free_search_paths(paths, i);
+                cbm_discover_free(files, file_count);
+                return NULL;
+            }
+        }
+    }
+    cbm_discover_free(files, file_count);
+    *out_count = file_count;
+    *out_ok = true;
+    return paths;
+}
+
+/* Append one in-process text match to the bounded result buffer. */
+static bool append_search_match(grep_match_t **matches, int *count, int *capacity,
+                                const char *relative_path, int line_number, const char *line) {
+    if (*count >= *capacity) {
+        int next_capacity = *capacity * PAIR_LEN;
+        grep_match_t *grown = safe_realloc(*matches, (size_t)next_capacity * sizeof(grep_match_t));
+        *matches = grown;
+        if (!grown) {
+            return false;
+        }
+        *capacity = next_capacity;
+    }
+    grep_match_t *match = &(*matches)[*count];
+    snprintf(match->file, sizeof(match->file), "%s", relative_path);
+    match->line = line_number;
+    snprintf(match->content, sizeof(match->content), "%s", line);
+    size_t content_len = strlen(match->content);
+    while (content_len > 0 &&
+           (match->content[content_len - 1] == '\n' || match->content[content_len - 1] == '\r')) {
+        match->content[--content_len] = '\0';
+    }
+    sanitize_ascii(match->content);
+    (*count)++;
+    return true;
+}
+
+/* Scan one source file using literal or POSIX-extended regular-expression
+ * matching. Canonical containment is checked before the file is opened. */
+static bool scan_search_file(const char *root_path, const char *canonical_root,
+                             const char *relative_path, const char *pattern, bool use_regex,
+                             cbm_regex_t *search_regex, int match_limit, grep_match_t **matches,
+                             int *match_count, int *match_capacity) {
+    size_t full_len = strlen(root_path) + strlen(relative_path) + MCP_SEPARATOR;
+    char *full_path = malloc(full_len);
+    if (!full_path) {
+        return false;
+    }
+    snprintf(full_path, full_len, "%s/%s", root_path, relative_path);
+    char canonical_file[CBM_SZ_4K];
+    if (!resolve_canonical_path(full_path, canonical_file, sizeof(canonical_file)) ||
+        !canonical_path_has_root(canonical_root, canonical_file)) {
+        free(full_path);
+        return true;
+    }
+
+    FILE *fp = cbm_fopen(full_path, "rb");
+    free(full_path);
+    if (!fp) {
+        return true;
+    }
+
+    char *line = NULL;
+    size_t line_capacity = 0;
+    int line_number = 0;
+    bool ok = true;
+    while (*match_count < match_limit && cbm_getline(&line, &line_capacity, fp) >= 0) {
+        line_number++;
+        bool matched = use_regex ? cbm_regexec(search_regex, line, 0, NULL, 0) == CBM_REG_OK
+                                 : strstr(line, pattern) != NULL;
+        if (matched && !append_search_match(matches, match_count, match_capacity, relative_path,
+                                            line_number, line)) {
+            ok = false;
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return ok;
+}
+
+/* Perform the complete search_code text phase in process. This deliberately
+ * avoids cmd.exe, PowerShell, grep, xargs, PATH lookup, and temporary files. */
+static grep_match_t *collect_native_search_matches(cbm_mcp_server_t *srv, const char *project,
+                                                   const char *root_path, const char *pattern,
+                                                   bool use_regex, const char *file_pattern,
+                                                   bool has_path_filter, cbm_regex_t *path_regex,
+                                                   int match_limit, int *out_count, bool *out_ok) {
+    *out_count = 0;
+    *out_ok = false;
+
+    cbm_regex_t search_regex;
+    bool search_regex_ready = false;
+    if (use_regex) {
+        if (cbm_regcomp(&search_regex, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != CBM_REG_OK) {
+            return NULL;
+        }
+        search_regex_ready = true;
+    }
+
+    char canonical_root[CBM_SZ_4K];
+    if (!resolve_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
+        if (search_regex_ready) {
+            cbm_regfree(&search_regex);
+        }
+        return NULL;
+    }
+
+    bool paths_ok = false;
+    int path_count = 0;
+    char **paths = collect_search_paths(srv, project, root_path, &path_count, &paths_ok);
+    if (!paths_ok) {
+        if (search_regex_ready) {
+            cbm_regfree(&search_regex);
+        }
+        return NULL;
+    }
+
+    int match_capacity = CBM_SZ_64;
+    grep_match_t *matches = malloc((size_t)match_capacity * sizeof(grep_match_t));
+    if (!matches) {
+        free_search_paths(paths, path_count);
+        if (search_regex_ready) {
+            cbm_regfree(&search_regex);
+        }
+        return NULL;
+    }
+
+    bool scan_ok = true;
+    for (int i = 0; i < path_count && *out_count < match_limit; i++) {
 #ifdef _WIN32
-    const char *sm = use_regex ? "" : " -SimpleMatch";
-    if (scoped) {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                "-LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | Where-Object { $_.Path -like '*%s' }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm, file_pattern);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                "-LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm);
-        }
-    } else {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
-                "-ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
-                "-ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
-                "SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
-                "-ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
-        }
-    }
-#else
-    const char *flag = use_regex ? "-E" : "-F";
-    if (scoped) {
-        if (file_pattern) {
-            /* -0: read NUL-separated paths from the filelist so paths containing
-             * spaces stay one argument (issue #687). Pairs with the NUL separator
-             * written by write_scoped_filelist. */
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
-        } else {
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
-        }
-    } else {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
-        } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
-        }
-    }
+        cbm_normalize_path_sep(paths[i]);
 #endif
+        if ((has_path_filter && cbm_regexec(path_regex, paths[i], 0, NULL, 0) != CBM_REG_OK) ||
+            !search_file_pattern_matches(file_pattern, paths[i])) {
+            continue;
+        }
+        if (!scan_search_file(root_path, canonical_root, paths[i], pattern, use_regex,
+                              search_regex_ready ? &search_regex : NULL, match_limit, &matches,
+                              out_count, &match_capacity)) {
+            scan_ok = false;
+            break;
+        }
+    }
+
+    free_search_paths(paths, path_count);
+    if (search_regex_ready) {
+        cbm_regfree(&search_regex);
+    }
+    if (!scan_ok) {
+        free(matches);
+        return NULL;
+    }
+    *out_ok = true;
+    return matches;
 }
 
 /* Build deduplicated file list from search results + raw matches. */
@@ -8792,77 +9132,6 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     return result;
 }
 
-/* Read grep output from fp, parse file:line:content format, apply path filter,
- * and return a dynamically-allocated grep_match_t array. */
-/* Strip root path prefix from a file path. */
-static const char *strip_root_prefix(const char *path, const char *root, size_t root_len) {
-    if (strncmp(path, root, root_len) != 0) {
-        return path;
-    }
-    const char *p = path + root_len;
-    if (*p == '/') {
-        p++;
-    }
-    return p;
-}
-
-static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
-                                          bool has_path_filter, cbm_regex_t *path_regex,
-                                          int grep_limit, int *out_count) {
-    int gm_cap = CBM_SZ_64;
-    int gm_count = 0;
-    grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
-    char line[CBM_SZ_2K];
-
-    while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-
-        /* PowerShell output uses tab as delimiter (paths may contain colons
-         * on Windows, e.g. C:\dir\file). Unix grep uses colon. */
-#ifdef _WIN32
-        char sep = '\t';
-#else
-        char sep = ':';
-#endif
-        char *sep1 = strchr(line, (unsigned char)sep);
-        if (!sep1) {
-            continue;
-        }
-        char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
-        if (!sep2) {
-            continue;
-        }
-        *sep1 = '\0';
-        *sep2 = '\0';
-
-#ifdef _WIN32
-        cbm_normalize_path_sep(line);
-#endif
-        const char *path = line;
-        const char *file = strip_root_prefix(path, root_path, root_len);
-
-        if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
-            continue;
-        }
-
-        safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
-        snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
-        gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
-        sanitize_ascii(gm[gm_count].content);
-        gm_count++;
-    }
-
-    *out_count = gm_count;
-    return gm;
-}
-
 /* Find the tightest node containing a line in a file. Returns index or -1. */
 static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
     int best = CBM_NOT_FOUND;
@@ -8965,79 +9234,6 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
-/* Write indexed file list for scoped grep. Returns true if scoped.
- * When a path_filter is provided, apply it here — before grep — so large
- * indexed projects do not scan files only for collect_grep_matches to discard
- * them later. The predicate is IDENTICAL to the post-grep filter: the same
- * compiled regex run against the same root-relative path (separators
- * normalized on Windows first), so prefiltering can only skip files whose
- * hits would be dropped anyway — results-preserving by construction.
- * *out_written receives the number of records written (0 = the filter
- * excluded every indexed file). */
-static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist, bool has_path_filter,
-                                  cbm_regex_t *path_regex, int *out_written) {
-    *out_written = 0;
-    cbm_store_t *pre_store = resolve_store(srv, project);
-    if (!pre_store) {
-        return false;
-    }
-    char **indexed_files = NULL;
-    int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
-        return false;
-    }
-    FILE *fl = fopen(filelist, "wb");
-    bool ok = false;
-    int written = 0;
-    if (fl) {
-        for (int fi = 0; fi < indexed_count; fi++) {
-            /* A source path never legitimately contains a newline or carriage
-             * return. Those bytes are exactly the record separator on the
-             * Windows filelist (and would split naive line readers elsewhere),
-             * so a crafted indexed path with an embedded newline could inject
-             * an extra entry into the scan set. Skip such paths entirely. */
-            if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
-                continue;
-            }
-            if (has_path_filter && path_regex) {
-#ifdef _WIN32
-                cbm_normalize_path_sep(indexed_files[fi]);
-#endif
-                if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
-                    continue;
-                }
-            }
-            /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
-             * arbitrarily long absolute path cannot overflow). Forward slash join
-             * so xargs doesn't treat Windows backslashes as escapes; binary mode
-             * (wb) prevents CRLF translation. Record separator differs by platform:
-             *   - Unix: NUL, consumed by `xargs -0` — handles spaces in paths (a
-             *     newline separator would split plain xargs on the space).
-             *   - Windows: newline, consumed by PowerShell `Get-Content |
-             *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
-            (void)fwrite(root_path, 1, strlen(root_path), fl);
-            (void)fputc('/', fl);
-            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
-#ifdef _WIN32
-            (void)fputc('\n', fl);
-#else
-            (void)fputc('\0', fl);
-#endif
-            written++;
-        }
-        (void)fclose(fl);
-        ok = true;
-    }
-    for (int fi = 0; fi < indexed_count; fi++) {
-        free(indexed_files[fi]);
-    }
-    free(indexed_files);
-    *out_written = written;
-    return ok;
-}
-
 /* Parse search mode string (0=compact, 1=full, 2=files). */
 static int parse_search_mode(const char *mode_str) {
     if (!mode_str) {
@@ -9052,12 +9248,8 @@ static int parse_search_mode(const char *mode_str) {
     return 0;
 }
 
-/* Validate shell-safe arguments for search. */
-/* Search/grep paths and globs are ALWAYS single-quoted (POSIX sh) or
- * double-/single-quoted (Windows cmd/PowerShell) on the command line, which
- * neutralises '&' — a very common character in real paths (R&D, "Foo & Bar",
- * OneDrive). Accept '&' here while still rejecting every metacharacter that
- * could break out of the quoting (#272). */
+/* Validate project paths before interpolation into the shell-backed
+ * detect_changes Git command. search_code does not use this shell boundary. */
 static bool validate_search_path_arg(const char *s) {
     if (!s) {
         return false;
@@ -9099,25 +9291,7 @@ static bool validate_windows_cmd_interpolation_arg(const char *s) {
 }
 
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
-    if (!validate_search_path_arg(root_path)) {
-        return false;
-    }
-    if (file_pattern && !validate_search_path_arg(file_pattern)) {
-        return false;
-    }
-    return true;
-}
-
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
-        return false;
-    }
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
-    return true;
+    return root_path && root_path[0] && (!file_pattern || strpbrk(file_pattern, "\r\n") == NULL);
 }
 
 /* Compile a path filter regex. Returns true if compiled successfully. */
@@ -9245,73 +9419,25 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_SZ_256];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
-                 strerror(errno));
+    /* ── Phase 1: In-process text scan ───────────────────────── */
+    /* Keep a bounded pre-ranking result set. Unlike the former shell pipeline,
+     * this scan has no external process, PATH dependency, or temporary files. */
+    enum { GREP_MAX_MATCHES = 500 };
+    int grep_limit = GREP_MAX_MATCHES;
+    int gm_count = 0;
+    bool scan_ok = false;
+    grep_match_t *gm = collect_native_search_matches(
+        srv, project, root_path, pattern, use_regex, file_pattern, has_path_filter,
+        has_path_filter ? &path_regex : NULL, grep_limit, &gm_count, &scan_ok);
+    if (!scan_ok) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result(errmsg, true);
-    }
-
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
-
-    /* Scope grep to indexed files only — avoids scanning vendored/generated code.
-     * Query the graph for distinct file paths, write them to a temp file,
-     * then use xargs to pass them to grep. Falls back to recursive grep if
-     * no indexed files found (project not fully indexed). */
-    char filelist[CBM_SZ_256];
-    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
-    bool scoped = false;
-    int scoped_written = 0;
-
-    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
-                                   has_path_filter ? &path_regex : NULL, &scoped_written);
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = NULL;
-    if (scoped && scoped_written == 0) {
-        /* The path_filter excluded every indexed file — nothing to scan.
-         * Skip the grep subprocess: xargs on an empty filelist is
-         * platform-dependent (GNU execs grep once with no operands, BSD
-         * skips), and the post-grep filter would drop every hit anyway. */
-        gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
-        cbm_unlink(tmpfile);
-        cbm_unlink(filelist);
-    } else {
-        char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
-                       root_path);
-
-        FILE *fp = cbm_popen(cmd, "r");
-        if (!fp) {
-            cbm_unlink(tmpfile);
-            if (scoped) {
-                cbm_unlink(filelist);
-            }
-            free(root_path);
-            free(pattern);
-            free(project);
-            free(file_pattern);
-            return cbm_mcp_text_result("search failed", true);
-        }
-
-        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
-                                  grep_limit, &gm_count);
-        cbm_pclose(fp);
-        cbm_unlink(tmpfile);
-        if (scoped) {
-            cbm_unlink(filelist);
-        }
+        return cbm_mcp_text_result("search failed: in-process text scan could not complete", true);
     }
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
@@ -10337,6 +10463,669 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+/*
+ * Return whether a tool is reserved for the trusted Vulcan controller.
+ *
+ * 返回工具是否仅供可信 Vulcan 控制器调用。
+ */
+static bool managed_control_tool(const char *tool_name) {
+    return tool_name && (strcmp(tool_name, "vulcan_sync_projects") == 0 ||
+                         strcmp(tool_name, "vulcan_project_status") == 0 ||
+                         strcmp(tool_name, "vulcan_reindex_project") == 0);
+}
+
+/*
+ * Build a stable structured managed-service error.
+ *
+ * 构造稳定的结构化托管服务错误。
+
+ */
+static char *managed_error_result(const char *code, const char *message) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code ? code : "managed_error");
+    yyjson_mut_obj_add_str(doc, root, "message", message ? message : "Managed request failed");
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json ? json : "Managed request failed", true);
+    free(json);
+    return result;
+}
+
+/*
+ * Normalize an absolute path without inventing an unavailable replacement.
+ *
+ * 规范化绝对路径，且不为不可用路径臆造替代值。
+ */
+static bool managed_normalize_absolute_path(const char *input, char *output, size_t output_size) {
+    if (!input || !output || output_size == 0U || strlen(input) >= output_size) {
+        return false;
+    }
+    (void)snprintf(output, output_size, "%s", input);
+    cbm_normalize_path_sep(output);
+    size_t length = strlen(output);
+    while (length > 1U && output[length - 1U] == '/') {
+#ifdef _WIN32
+        if (length == 3U && output[1] == ':') {
+            break;
+        }
+#endif
+        output[--length] = '\0';
+    }
+    return repo_path_is_absolute(output);
+}
+
+/*
+ * Resolve a host path to canonical authorization data.
+ *
+ * 将宿主路径解析为规范化授权数据。
+
+ */
+static bool managed_resolve_path(cbm_mcp_server_t *srv, const char *project_id, const char *pwd,
+                                 bool allow_offline, cbm_managed_project_input_t *input_out,
+                                 char canonical_out[CBM_MANAGED_PROJECT_PATH_CAP],
+                                 char project_key_out[CBM_MANAGED_PROJECT_KEY_CAP]) {
+    if (!srv || !srv->managed_projects || !project_id || !project_id[0] || !pwd || !pwd[0] ||
+        !input_out || !canonical_out || !project_key_out) {
+        return false;
+    }
+    char normalized[CBM_MANAGED_PROJECT_PATH_CAP];
+    if (!managed_normalize_absolute_path(pwd, normalized, sizeof(normalized))) {
+        return false;
+    }
+    bool available = cbm_is_dir(normalized);
+    if (available) {
+        if (!cbm_canonical_path(normalized, canonical_out, CBM_MANAGED_PROJECT_PATH_CAP)) {
+            return false;
+        }
+        cbm_normalize_path_sep(canonical_out);
+        char *project_key = cbm_project_name_from_path(canonical_out);
+        if (!project_key || strlen(project_key) >= CBM_MANAGED_PROJECT_KEY_CAP ||
+            !cbm_validate_project_name(project_key)) {
+            free(project_key);
+            return false;
+        }
+        (void)snprintf(project_key_out, CBM_MANAGED_PROJECT_KEY_CAP, "%s", project_key);
+        free(project_key);
+    } else {
+        cbm_managed_project_entry_t existing = {0};
+        if (!allow_offline || !cbm_managed_project_registry_resolve_offline(
+                                  srv->managed_projects, project_id, normalized, &existing)) {
+            return false;
+        }
+        (void)snprintf(canonical_out, CBM_MANAGED_PROJECT_PATH_CAP, "%s", existing.canonical_root);
+        (void)snprintf(project_key_out, CBM_MANAGED_PROJECT_KEY_CAP, "%s", existing.project_key);
+    }
+    input_out->project_id = project_id;
+    input_out->canonical_root = canonical_out;
+    input_out->project_key = project_key_out;
+    input_out->root_available = available;
+    return true;
+}
+
+/*
+ * Return one uniquely named object member and reject duplicate spellings.
+ *
+ * 返回唯一命名的对象成员，并拒绝重复拼写。
+ */
+static yyjson_val *managed_unique_member(yyjson_val *object, const char *name) {
+    if (!yyjson_is_obj(object) || !name) {
+        return NULL;
+    }
+    /* Unique value found so far.
+     * 当前已找到的唯一值。 */
+    yyjson_val *found = NULL;
+    /* Object iteration state.
+     * 对象迭代状态。 */
+    size_t index = 0U;
+    size_t maximum = 0U;
+    yyjson_val *key = NULL;
+    yyjson_val *value = NULL;
+    yyjson_obj_foreach(object, index, maximum, key, value) {
+        if (strcmp(yyjson_get_str(key), name) == 0) {
+            if (found) {
+                return NULL;
+            }
+            found = value;
+        }
+    }
+    return found;
+}
+
+/*
+ * Parse and authorize the hidden context injected by Vulcan Code.
+ * 解析并授权 Vulcan Code
+ * 注入的隐藏上下文。
+ */
+static char *managed_authorized_arguments(cbm_mcp_server_t *srv, const char *args_json,
+                                          const char *tool_name, char **error_code_out) {
+    if (error_code_out) {
+        *error_code_out = NULL;
+    }
+    yyjson_doc *doc = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        if (error_code_out) {
+            *error_code_out = heap_strdup("invalid_arguments");
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    static const char *const forbidden[] = {
+        "project", "project_name", "project_id", "projectName", "repo_path",
+    };
+    for (size_t index = 0U; index < sizeof(forbidden) / sizeof(forbidden[0]); index++) {
+        if (yyjson_obj_get(root, forbidden[index])) {
+            if (error_code_out) {
+                *error_code_out = heap_strdup("model_project_override");
+            }
+            yyjson_doc_free(doc);
+            return NULL;
+        }
+    }
+    yyjson_val *context = managed_unique_member(root, "_vulcan");
+    yyjson_val *contract = context ? managed_unique_member(context, "contract") : NULL;
+    yyjson_val *project_id = context ? managed_unique_member(context, "project_id") : NULL;
+    yyjson_val *pwd = context ? managed_unique_member(context, "pwd") : NULL;
+    yyjson_val *session_id = context ? managed_unique_member(context, "session_id") : NULL;
+    if (contract && yyjson_is_str(contract) &&
+        strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0) {
+        if (error_code_out) {
+            *error_code_out = heap_strdup("contract_mismatch");
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    if (!context || !yyjson_is_obj(context) || yyjson_obj_size(context) != 4U || !contract ||
+        !yyjson_is_str(contract) ||
+        strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0 || !project_id ||
+        !yyjson_is_str(project_id) || !yyjson_get_str(project_id)[0] ||
+        strlen(yyjson_get_str(project_id)) >= CBM_MANAGED_PROJECT_ID_CAP || !pwd ||
+        !yyjson_is_str(pwd) || !yyjson_get_str(pwd)[0] ||
+        strlen(yyjson_get_str(pwd)) >= CBM_MANAGED_PROJECT_PATH_CAP || !session_id ||
+        !yyjson_is_str(session_id) || !yyjson_get_str(session_id)[0] ||
+        strlen(yyjson_get_str(session_id)) >= CBM_MANAGED_PROJECT_PATH_CAP) {
+        if (error_code_out) {
+            *error_code_out = heap_strdup("invalid_vulcan_context");
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    cbm_managed_project_input_t resolved = {0};
+    char canonical[CBM_MANAGED_PROJECT_PATH_CAP];
+    char project_key[CBM_MANAGED_PROJECT_KEY_CAP];
+    if (!managed_resolve_path(srv, yyjson_get_str(project_id), yyjson_get_str(pwd), false,
+                              &resolved, canonical, project_key)) {
+        if (error_code_out) {
+            *error_code_out = heap_strdup("path_unavailable");
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    cbm_managed_project_entry_t authorized = {0};
+    if (!cbm_managed_project_registry_authorize(srv->managed_projects, yyjson_get_str(project_id),
+                                                canonical, &authorized)) {
+        if (error_code_out) {
+            cbm_managed_project_entry_t registered = {0};
+            const char *code = cbm_managed_project_registry_get_by_root(srv->managed_projects,
+                                                                        canonical, &registered)
+                                   ? "project_id_mismatch"
+                               : cbm_managed_project_registry_get_by_id(
+                                     srv->managed_projects, yyjson_get_str(project_id), &registered)
+                                   ? "project_not_authorized"
+                                   : "unknown_project";
+            *error_code_out = heap_strdup(code);
+        }
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    yyjson_mut_doc *normalized_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *normalized = yyjson_val_mut_copy(normalized_doc, yyjson_doc_get_root(doc));
+    yyjson_mut_doc_set_root(normalized_doc, normalized);
+    yyjson_mut_obj_remove_str(normalized, "_vulcan");
+    yyjson_mut_obj_add_str(normalized_doc, normalized, "project", authorized.project_key);
+    char *normalized_json = yy_doc_to_str(normalized_doc);
+    yyjson_mut_doc_free(normalized_doc);
+
+    char session_digest[CBM_SHA256_HEX_LEN + 1U];
+    const char *session = yyjson_get_str(session_id);
+    cbm_sha256_hex(session, strlen(session), session_digest);
+    session_digest[12] = '\0';
+    cbm_log_control("vulcan.request.authorized", "project_id", authorized.project_id, "project_key",
+                    authorized.project_key, "session_digest", session_digest, "tool",
+                    tool_name ? tool_name : "");
+    yyjson_doc_free(doc);
+    return normalized_json;
+}
+
+/*
+ * Return a textual managed lifecycle name.
+ * 返回托管生命周期的文本名称。
+ */
+static const char *managed_lifecycle_name(cbm_managed_project_lifecycle_t lifecycle) {
+    switch (lifecycle) {
+    case CBM_MANAGED_PROJECT_PENDING:
+        return "pending";
+    case CBM_MANAGED_PROJECT_INDEXING:
+        return "indexing";
+    case CBM_MANAGED_PROJECT_READY:
+        return "ready";
+    case CBM_MANAGED_PROJECT_OFFLINE:
+        return "offline";
+    case CBM_MANAGED_PROJECT_FAILED:
+        return "failed";
+    }
+    return "unknown";
+}
+
+/*
+ * Return the controller-facing indexing state for one managed lifecycle.
+ *
+ * 返回一个托管生命周期对应的控制器侧索引状态。
+ */
+static const char *managed_index_status_name(cbm_managed_project_lifecycle_t lifecycle) {
+    switch (lifecycle) {
+    case CBM_MANAGED_PROJECT_PENDING:
+        return "pending";
+    case CBM_MANAGED_PROJECT_INDEXING:
+        return "running";
+    case CBM_MANAGED_PROJECT_READY:
+        return "idle";
+    case CBM_MANAGED_PROJECT_OFFLINE:
+        return "paused";
+    case CBM_MANAGED_PROJECT_FAILED:
+        return "failed";
+    }
+    return "unknown";
+}
+
+/*
+ * Add the exact reusable project diagnostics required by the Vulcan contract.
+ * 添加 Vulcan 契约要求的精确可复用项目诊断字段。
+ *
+ * Parameters:
+ * doc: Response document that owns every added value.
+ * object: Project response object receiving diagnostics.
+ * project: Immutable registry snapshot used as the authority.
+ *
+ * 参数：
+ * doc：拥有全部新增值的响应文档。
+ * object：接收诊断字段的项目响应对象。
+ * project：作为权威来源的不可变注册表快照。
+ */
+static void managed_add_project_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val *object,
+                                            const cbm_managed_project_entry_t *project) {
+    yyjson_mut_obj_add_str(doc, object, "lifecycle", managed_lifecycle_name(project->lifecycle));
+    yyjson_mut_obj_add_str(doc, object, "index_status",
+                           managed_index_status_name(project->lifecycle));
+    yyjson_mut_obj_add_bool(doc, object, "watcher_registered", project->watcher_registered);
+    yyjson_mut_obj_add_uint(doc, object, "index_revision", project->index_revision);
+    yyjson_mut_obj_add_uint(doc, object, "last_success_at_ms", project->last_success_at_ms);
+    if (project->last_error_code[0]) {
+        /*
+         * Copy registry diagnostics because callers may serialize after the
+         *
+         * project snapshot leaves its stack scope.
+         *
+         * 复制注册表诊断字符串，因为调用方可能在项目快照离开栈作用域后才序列化。
+
+         */
+        yyjson_mut_obj_add_strcpy(doc, object, "error_code", project->last_error_code);
+    }
+    if (project->last_error_message[0]) {
+        yyjson_mut_obj_add_strcpy(doc, object, "error", project->last_error_message);
+    }
+}
+
+/*
+ * Parse and authorize an exact controller identity tuple.
+ *
+ * 解析并授权精确的控制器身份元组。
+
+ */
+static bool managed_parse_control_identity(cbm_mcp_server_t *srv, const char *args_json,
+                                           bool allow_offline,
+                                           cbm_managed_project_entry_t *project_out,
+                                           const char **error_out) {
+    if (error_out) {
+        *error_out = "invalid_arguments";
+    }
+    yyjson_doc *doc = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *contract = root ? yyjson_obj_get(root, "contract") : NULL;
+    yyjson_val *project_id = root ? yyjson_obj_get(root, "project_id") : NULL;
+    yyjson_val *pwd = root ? yyjson_obj_get(root, "pwd") : NULL;
+    if (contract && yyjson_is_str(contract) &&
+        strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0) {
+        if (error_out) {
+            *error_out = "contract_mismatch";
+        }
+        yyjson_doc_free(doc);
+        return false;
+    }
+    bool valid = root && yyjson_is_obj(root) && yyjson_obj_size(root) == 3U && contract &&
+                 yyjson_is_str(contract) &&
+                 strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) == 0 && project_id &&
+                 yyjson_is_str(project_id) && yyjson_get_str(project_id)[0] && pwd &&
+                 yyjson_is_str(pwd) && yyjson_get_str(pwd)[0];
+    if (!valid) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    cbm_managed_project_input_t resolved = {0};
+    char canonical[CBM_MANAGED_PROJECT_PATH_CAP];
+    char project_key[CBM_MANAGED_PROJECT_KEY_CAP];
+    if (!managed_resolve_path(srv, yyjson_get_str(project_id), yyjson_get_str(pwd), allow_offline,
+                              &resolved, canonical, project_key)) {
+        if (error_out) {
+            *error_out = "path_unavailable";
+        }
+        yyjson_doc_free(doc);
+        return false;
+    }
+    bool authorized =
+        resolved.root_available
+            ? cbm_managed_project_registry_authorize(
+                  srv->managed_projects, yyjson_get_str(project_id), canonical, project_out)
+            : cbm_managed_project_registry_get_by_id(srv->managed_projects,
+                                                     yyjson_get_str(project_id), project_out);
+    if (!authorized && error_out) {
+        *error_out = "project_not_authorized";
+    }
+    yyjson_doc_free(doc);
+    return authorized;
+}
+
+/*
+ * Verify that a published database contains the expected managed project.
+ *
+ * 验证已发布数据库确实包含预期托管项目。
+ */
+static bool managed_database_available(const char *project_key, const char *database_path) {
+    if (!project_key || !database_path || cbm_file_size(database_path) < 0) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(database_path);
+    if (!store) {
+        return false;
+    }
+    cbm_project_t project = {0};
+    bool available = cbm_store_check_integrity(store) &&
+                     cbm_store_get_project(store, project_key, &project) == CBM_STORE_OK;
+    if (available) {
+        cbm_project_free_fields(&project);
+    }
+    cbm_store_close(store);
+    return available;
+}
+
+/*
+ * Reconcile the complete authoritative Vulcan project generation.
+ * 对账完整的 Vulcan
+ * 权威项目 generation。
+ */
+static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args) {
+    if (!srv || !srv->managed_projects || !srv->managed_ops || !srv->managed_ops->watch_project ||
+        !srv->managed_ops->unwatch_project || !srv->managed_ops->schedule_index ||
+        !srv->managed_ops->cancel_index) {
+        return managed_error_result("managed_mode_required", "Vulcan managed mode is not active");
+    }
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *contract = root ? yyjson_obj_get(root, "contract") : NULL;
+    yyjson_val *generation = root ? yyjson_obj_get(root, "generation") : NULL;
+    yyjson_val *projects = root ? yyjson_obj_get(root, "projects") : NULL;
+    if (contract && yyjson_is_str(contract) &&
+        strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0) {
+        yyjson_doc_free(doc);
+        return managed_error_result("contract_mismatch",
+                                    "The Vulcan managed contract does not match");
+    }
+    if (!root || !yyjson_is_obj(root) || yyjson_obj_size(root) != 3U || !contract ||
+        !yyjson_is_str(contract) ||
+        strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0 || !generation ||
+        !yyjson_is_uint(generation) || yyjson_get_uint(generation) == 0U || !projects ||
+        !yyjson_is_arr(projects) || yyjson_arr_size(projects) > 4096U) {
+        yyjson_doc_free(doc);
+        return managed_error_result("invalid_sync_request",
+                                    "Invalid Vulcan project synchronization request");
+    }
+    cbm_managed_project_registry_reconcile_begin(srv->managed_projects);
+
+    size_t count = yyjson_arr_size(projects);
+    cbm_managed_project_input_t *inputs = count ? calloc(count, sizeof(*inputs)) : NULL;
+    char (*canonical)[CBM_MANAGED_PROJECT_PATH_CAP] =
+        count ? calloc(count, sizeof(*canonical)) : NULL;
+    char (*keys)[CBM_MANAGED_PROJECT_KEY_CAP] = count ? calloc(count, sizeof(*keys)) : NULL;
+    if (count && (!inputs || !canonical || !keys)) {
+        free(inputs);
+        free(canonical);
+        free(keys);
+        yyjson_doc_free(doc);
+        cbm_managed_project_registry_reconcile_end(srv->managed_projects);
+        return managed_error_result("no_memory", "Unable to allocate synchronization input");
+    }
+    bool valid = true;
+    size_t index = 0U;
+    size_t maximum = 0U;
+    yyjson_val *item = NULL;
+    yyjson_arr_foreach(projects, index, maximum, item) {
+        yyjson_val *project_id = yyjson_is_obj(item) ? yyjson_obj_get(item, "project_id") : NULL;
+        yyjson_val *pwd = yyjson_is_obj(item) ? yyjson_obj_get(item, "pwd") : NULL;
+        if (!yyjson_is_obj(item) || yyjson_obj_size(item) != 2U || !project_id ||
+            !yyjson_is_str(project_id) || !yyjson_get_str(project_id)[0] || !pwd ||
+            !yyjson_is_str(pwd) || !yyjson_get_str(pwd)[0] ||
+            !managed_resolve_path(srv, yyjson_get_str(project_id), yyjson_get_str(pwd), true,
+                                  &inputs[index], canonical[index], keys[index])) {
+            valid = false;
+            break;
+        }
+    }
+    if (!valid) {
+        free(inputs);
+        free(canonical);
+        free(keys);
+        yyjson_doc_free(doc);
+        cbm_managed_project_registry_reconcile_end(srv->managed_projects);
+        return managed_error_result(
+            "invalid_project",
+            "Every project must have a unique id and an authorized absolute root");
+    }
+
+    cbm_managed_sync_result_t sync = {0};
+    bool committed = cbm_managed_project_registry_sync(
+        srv->managed_projects, yyjson_get_uint(generation), inputs, count, &sync);
+    free(inputs);
+    free(canonical);
+    free(keys);
+    yyjson_doc_free(doc);
+    if (!committed) {
+        const char *code = sync.status == CBM_MANAGED_SYNC_STALE_GENERATION ? "stale_generation"
+                           : sync.status == CBM_MANAGED_SYNC_CONFLICT       ? "project_conflict"
+                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY ? "no_memory"
+                                                                       : "invalid_sync_request";
+        cbm_managed_sync_result_free(&sync);
+        cbm_managed_project_registry_reconcile_end(srv->managed_projects);
+        return managed_error_result(code, "Project synchronization was rejected");
+    }
+
+    for (size_t change_index = 0U; change_index < sync.change_count; change_index++) {
+        cbm_managed_project_change_t *change = &sync.changes[change_index];
+        if (change->kind == CBM_MANAGED_PROJECT_REMOVED) {
+            srv->managed_ops->cancel_index(srv->managed_ops_context, change->project.project_key);
+            srv->managed_ops->unwatch_project(srv->managed_ops_context,
+                                              change->project.project_key);
+            continue;
+        }
+        if (!cbm_is_dir(change->project.canonical_root)) {
+            srv->managed_ops->unwatch_project(srv->managed_ops_context,
+                                              change->project.project_key);
+            (void)cbm_managed_project_registry_mark_offline(srv->managed_projects,
+                                                            change->project.project_key);
+            continue;
+        }
+        char database_path[CBM_SZ_2K];
+        project_db_path(change->project.project_key, database_path, sizeof(database_path));
+        if (managed_database_available(change->project.project_key, database_path)) {
+            bool watched = srv->managed_ops->watch_project(srv->managed_ops_context,
+                                                           change->project.project_key,
+                                                           change->project.canonical_root);
+            if (!watched) {
+                /* A disappearing root is offline, not a watcher failure.
+                 *
+                 * 消失的根路径属于离线状态，而不是 watcher 故障。 */
+                if (!cbm_is_dir(change->project.canonical_root)) {
+                    (void)cbm_managed_project_registry_mark_offline(srv->managed_projects,
+                                                                    change->project.project_key);
+                } else {
+                    (void)cbm_managed_project_registry_publish_index(
+                        srv->managed_projects, change->project.project_key, false, cbm_now_ms(),
+                        "watch_registration_failed", "Managed watcher registration failed");
+                }
+            }
+        } else {
+            cbm_mcp_managed_index_status_t scheduled = srv->managed_ops->schedule_index(
+                srv->managed_ops_context, change->project.project_key,
+                change->project.canonical_root, false);
+            if (scheduled == CBM_MCP_MANAGED_INDEX_FAILED) {
+                (void)cbm_managed_project_registry_publish_index(
+                    srv->managed_projects, change->project.project_key, false, cbm_now_ms(),
+                    "index_schedule_failed", "Managed index scheduling failed");
+            }
+        }
+    }
+
+    yyjson_mut_doc *response_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *response = yyjson_mut_obj(response_doc);
+    yyjson_mut_doc_set_root(response_doc, response);
+    yyjson_mut_obj_add_str(response_doc, response, "contract", CBM_VULCAN_MANAGED_CONTRACT);
+    yyjson_mut_obj_add_str(response_doc, response, "status", "committed");
+    yyjson_mut_obj_add_uint(response_doc, response, "generation", sync.generation);
+    yyjson_mut_obj_add_uint(response_doc, response, "project_count", count);
+    yyjson_mut_obj_add_uint(response_doc, response, "added", sync.added);
+    yyjson_mut_obj_add_uint(response_doc, response, "retained", sync.retained);
+    yyjson_mut_obj_add_uint(response_doc, response, "removed", sync.removed);
+    /* Number of active projects that remain failed in the committed snapshot.
+     *
+     *
+     * 已提交快照中仍处于失败状态的活动项目数量。 */
+    size_t failed = 0U;
+    yyjson_mut_val *project_statuses = yyjson_mut_arr(response_doc);
+    for (size_t status_index = 0U; status_index < sync.change_count; status_index++) {
+        cbm_managed_project_change_t *change = &sync.changes[status_index];
+        if (change->kind == CBM_MANAGED_PROJECT_REMOVED) {
+            continue;
+        }
+        cbm_managed_project_entry_t current = change->project;
+        (void)cbm_managed_project_registry_get_by_key(srv->managed_projects,
+                                                      change->project.project_key, &current);
+        yyjson_mut_val *status = yyjson_mut_obj(response_doc);
+        yyjson_mut_obj_add_str(response_doc, status, "project_id", change->project.project_id);
+        bool accepted = current.lifecycle != CBM_MANAGED_PROJECT_FAILED;
+        if (!accepted) {
+            failed++;
+        }
+        yyjson_mut_obj_add_bool(response_doc, status, "accepted", accepted);
+        yyjson_mut_obj_add_str(response_doc, status, "change",
+                               change->kind == CBM_MANAGED_PROJECT_ADDED ? "added" : "retained");
+        managed_add_project_diagnostics(response_doc, status, &current);
+        yyjson_mut_arr_add_val(project_statuses, status);
+    }
+    yyjson_mut_obj_add_uint(response_doc, response, "failed", failed);
+    yyjson_mut_obj_add_val(response_doc, response, "projects", project_statuses);
+    char *json = yy_doc_to_str(response_doc);
+    yyjson_mut_doc_free(response_doc);
+    char generation_text[CBM_SZ_32];
+    char project_count_text[CBM_SZ_32];
+    char added_text[CBM_SZ_32];
+    char retained_text[CBM_SZ_32];
+    char removed_text[CBM_SZ_32];
+    char failed_text[CBM_SZ_32];
+    (void)snprintf(generation_text, sizeof(generation_text), "%llu",
+                   (unsigned long long)sync.generation);
+    (void)snprintf(project_count_text, sizeof(project_count_text), "%zu", count);
+    (void)snprintf(added_text, sizeof(added_text), "%zu", sync.added);
+    (void)snprintf(retained_text, sizeof(retained_text), "%zu", sync.retained);
+    (void)snprintf(removed_text, sizeof(removed_text), "%zu", sync.removed);
+    (void)snprintf(failed_text, sizeof(failed_text), "%zu", failed);
+    cbm_log_control("vulcan.projects.synchronized", "generation", generation_text, "project_count",
+                    project_count_text, "added", added_text, "retained", retained_text, "removed",
+                    removed_text, "failed", failed_text);
+    cbm_managed_sync_result_free(&sync);
+    cbm_managed_project_registry_reconcile_end(srv->managed_projects);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+/*
+ * Return registry and graph status for one authorized project.
+ *
+ * 返回一个已授权项目的注册表与图状态。
+ */
+static char *handle_vulcan_project_status(cbm_mcp_server_t *srv, const char *args) {
+    cbm_managed_project_entry_t project = {0};
+    const char *error = NULL;
+    if (!managed_parse_control_identity(srv, args, true, &project, &error)) {
+        return managed_error_result(error, "Vulcan project authorization failed");
+    }
+    cbm_store_t *store = resolve_store(srv, project.project_key);
+    int nodes = store ? cbm_store_count_nodes(store, project.project_key) : 0;
+    int edges = store ? cbm_store_count_edges(store, project.project_key) : 0;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "contract", CBM_VULCAN_MANAGED_CONTRACT);
+    yyjson_mut_obj_add_str(doc, root, "project_id", project.project_id);
+    managed_add_project_diagnostics(doc, root, &project);
+    yyjson_mut_obj_add_int(doc, root, "nodes", nodes < 0 ? 0 : nodes);
+    yyjson_mut_obj_add_int(doc, root, "edges", edges < 0 ? 0 : edges);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+/*
+ * Schedule one authorized full reindex without duplicating a physical job.
+ *
+ * 调度一次已授权的全量重建索引，同时避免重复物理任务。
+ */
+static char *handle_vulcan_reindex_project(cbm_mcp_server_t *srv, const char *args) {
+    cbm_managed_project_entry_t project = {0};
+    const char *error = NULL;
+    if (!managed_parse_control_identity(srv, args, false, &project, &error)) {
+        return managed_error_result(error, "Vulcan project authorization failed");
+    }
+    if (!srv->managed_ops || !srv->managed_ops->schedule_index) {
+        return managed_error_result("managed_runtime_unavailable",
+                                    "Managed index scheduler is unavailable");
+    }
+    cbm_mcp_managed_index_status_t status = srv->managed_ops->schedule_index(
+        srv->managed_ops_context, project.project_key, project.canonical_root, true);
+    if (status == CBM_MCP_MANAGED_INDEX_FAILED) {
+        return managed_error_result("index_schedule_failed",
+                                    "Unable to schedule the managed index");
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "contract", CBM_VULCAN_MANAGED_CONTRACT);
+    yyjson_mut_obj_add_str(doc, root, "project_id", project.project_id);
+    yyjson_mut_obj_add_bool(doc, root, "accepted", true);
+    yyjson_mut_obj_add_str(doc, root, "status",
+                           status == CBM_MCP_MANAGED_INDEX_RUNNING ? "running" : "started");
+    yyjson_mut_obj_add_bool(doc, root, "coalesced", status == CBM_MCP_MANAGED_INDEX_RUNNING);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
@@ -10395,6 +11184,15 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
     }
+    if (strcmp(tool_name, "vulcan_sync_projects") == 0) {
+        return handle_vulcan_sync_projects(srv, args_json);
+    }
+    if (strcmp(tool_name, "vulcan_project_status") == 0) {
+        return handle_vulcan_project_status(srv, args_json);
+    }
+    if (strcmp(tool_name, "vulcan_reindex_project") == 0) {
+        return handle_vulcan_reindex_project(srv, args_json);
+    }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
@@ -10421,7 +11219,40 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         release_request_store(srv);
         return cbm_mcp_text_result("request cancellation scope unavailable", true);
     }
-    char *result = dispatch_tool(srv, tool_name, args_json);
+    char *normalized_args = NULL;
+    char *normalization_error = NULL;
+    const char *dispatch_args = args_json ? args_json : "{}";
+    char *result = NULL;
+    if (srv && srv->tool_profile == CBM_MCP_TOOL_PROFILE_VULCAN &&
+        !managed_control_tool(tool_name)) {
+        if (!mcp_tool_allowed(srv->tool_profile, tool_name)) {
+            result = managed_error_result("forbidden_tool",
+                                          "This tool is unavailable in the Vulcan managed profile");
+        } else {
+            normalized_args =
+                managed_authorized_arguments(srv, dispatch_args, tool_name, &normalization_error);
+            if (!normalized_args) {
+                result = managed_error_result(
+                    normalization_error ? normalization_error : "invalid_vulcan_context",
+                    "The Vulcan host context is missing, invalid, or unauthorized");
+            } else {
+                result = dispatch_tool(srv, tool_name, normalized_args);
+            }
+        }
+    } else {
+        yyjson_doc *argument_doc = yyjson_read(dispatch_args, strlen(dispatch_args), 0);
+        yyjson_val *argument_root = argument_doc ? yyjson_doc_get_root(argument_doc) : NULL;
+        bool injected_context = argument_root && yyjson_is_obj(argument_root) &&
+                                yyjson_obj_get(argument_root, "_vulcan") != NULL;
+        yyjson_doc_free(argument_doc);
+        result =
+            injected_context
+                ? managed_error_result("unexpected_vulcan_context",
+                                       "Vulcan context is accepted only by the managed service")
+                : dispatch_tool(srv, tool_name, dispatch_args);
+    }
+    free(normalized_args);
+    free(normalization_error);
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);
     }
@@ -10815,9 +11646,16 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "resources/templates/list") == 0) {
         result_json = heap_strdup("{\"resourceTemplates\":[]}");
     } else if (strcmp(req.method, "prompts/list") == 0) {
-        result_json = cbm_mcp_prompts_list();
+        result_json = srv->tool_profile == CBM_MCP_TOOL_PROFILE_VULCAN
+                          ? heap_strdup("{\"prompts\":[]}")
+                          : cbm_mcp_prompts_list();
     } else if (strcmp(req.method, "prompts/get") == 0) {
-        result_json = cbm_mcp_prompt_get(req.params_raw, &request_error_json);
+        if (srv->tool_profile == CBM_MCP_TOOL_PROFILE_VULCAN) {
+            request_error_json = heap_strdup(
+                "{\"code\":-32601,\"message\":\"Prompts are unavailable in Vulcan managed mode\"}");
+        } else {
+            result_json = cbm_mcp_prompt_get(req.params_raw, &request_error_json);
+        }
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list_page(srv->tool_profile, req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {

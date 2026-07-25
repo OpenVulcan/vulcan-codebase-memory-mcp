@@ -54,8 +54,7 @@ static bool tf_invoked_as_windows_git_module(void) {
      * Inspect the actual loaded module so the copied git.exe probe cannot fall
      * through into the ordinary test runner when argv[0] is merely "git". */
     wchar_t image[32768];
-    DWORD image_length =
-        GetModuleFileNameW(NULL, image, (DWORD)(sizeof(image) / sizeof(image[0])));
+    DWORD image_length = GetModuleFileNameW(NULL, image, (DWORD)(sizeof(image) / sizeof(image[0])));
     if (image_length == 0 || image_length >= (DWORD)(sizeof(image) / sizeof(image[0]))) {
         return false;
     }
@@ -86,8 +85,7 @@ static bool tf_invoked_as_blocking_git(const char *argv0) {
             base = cursor + 1;
         }
     }
-    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 ||
-           strcmp(base, "GIT.EXE") == 0;
+    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 || strcmp(base, "GIT.EXE") == 0;
 #endif
 }
 
@@ -624,6 +622,7 @@ extern void suite_mcp(void);
 extern void suite_mcp_mutation_guard(void);
 extern void suite_index_supervisor(void);
 extern void suite_daemon(void);
+extern void suite_managed_project_registry(void);
 extern void suite_project_lock(void);
 extern void suite_version_cohort(void);
 extern void suite_daemon_version(void);
@@ -867,6 +866,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(index_supervisor);
 
     /* Shared MCP daemon coordination + private framing */
+    RUN_SELECTED_SUITE(managed_project_registry);
     RUN_SELECTED_SUITE(daemon);
     RUN_SELECTED_SUITE(project_lock);
     RUN_SELECTED_SUITE(version_cohort);

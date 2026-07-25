@@ -18,7 +18,8 @@
 
 #define CBM_DAEMON_INTERNAL_ARG "--cbm-daemon-internal"
 #define CBM_DAEMON_PERMANENT_ARG "--cbm-daemon-permanent"
-#define CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC 3U
+#define CBM_DAEMON_VULCAN_MANAGED_ARG "--cbm-vulcan-managed-internal"
+#define CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC 4U
 
 typedef enum {
     CBM_DAEMON_PROCESS_INVALID = 0,
@@ -45,6 +46,14 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role);
  * ABI values must never create parallel daemon namespaces. */
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent);
 
+/*
+ * Create the endpoint for the selected immutable product identity.
+ *
+ * 为选定的不可变产品身份创建端点。
+ */
+cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new_for_product(const char *runtime_parent,
+                                                                         bool vulcan_managed);
+
 /* Cross-platform launch policy for the daemon child. The child is invoked
  * directly (never through a shell), with exactly argv[0] plus the one hidden
  * internal argument. It is detached from the launching client's lifetime and
@@ -67,6 +76,13 @@ bool cbm_daemon_bootstrap_launch_spec_init(const char *executable_path,
 bool cbm_daemon_bootstrap_launch_spec_init_permanent(const char *executable_path,
                                                      cbm_daemon_bootstrap_launch_spec_t *spec_out);
 
+/*
+ * Build the exact application-scoped Vulcan-managed daemon launch grammar.
+ * 构造精确的应用级 Vulcan 托管 daemon 启动语法。
+ */
+bool cbm_daemon_bootstrap_launch_spec_init_vulcan_managed(
+    const char *executable_path, cbm_daemon_bootstrap_launch_spec_t *spec_out);
+
 typedef enum {
     CBM_DAEMON_BOOTSTRAP_FAILED = 0,
     CBM_DAEMON_BOOTSTRAP_BYPASSED,
@@ -85,6 +101,9 @@ typedef struct {
      * generation instead of an ephemeral one. Client bootstraps leave this
      * false — they must never mint permanence implicitly. */
     bool spawn_permanent;
+    /* Select the dedicated Vulcan product identity and application-scoped launch.
+     * 选择独立的 Vulcan 产品身份和应用级启动方式。 */
+    bool vulcan_managed;
 } cbm_daemon_bootstrap_config_t;
 
 typedef struct {
