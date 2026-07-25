@@ -20,7 +20,8 @@
  *         into the graph.
  *
  * RED vs GREEN — this is a STATUS BOARD, not a pass/fail gate (runs only under
- *   make test-repro / bug-repro.yml, never the branch-protection ci-ok gate):
+ *   manual `make test-repro`, never the branch-protection ci-ok gate).
+ *   仅通过手工执行 `make test-repro` 运行，不进入分支保护 ci-ok 门禁。
  *     - GREEN  = the LSP strategy works end-to-end = a permanent regression
  *                guard that it keeps working.
  *     - RED    = the strategy is dropped, or the call lands Module-sourced, or

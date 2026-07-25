@@ -8,11 +8,12 @@
  *
  * Because these cases are red by design, they MUST NOT live in `ALL_TEST_SRCS`
  * (that would turn the PR gate `ci-ok` red and wedge every merge). They are built
- * + run only via `make test-repro` and the `bug-repro.yml` workflow, neither of
- * which gates branch protection.
+ * + run only via the manual `make test-repro` target, outside branch protection.
+ * + 仅通过手工执行 `make test-repro` 运行，不进入分支保护门禁。
  *
  * Exit status: non-zero when any reproduction is still RED (the expected state).
- * The `bug-repro.yml` workflow treats that as the status board, not a hard fail.
+ * Manual execution treats that as status-board output rather than a hard gate.
+ * 手工执行将该结果视为状态板输出，而不是强制门禁失败。
  *
  * Adding a cluster:
  *   1. create tests/repro/repro_<cluster>.c exporting `void suite_repro_<cluster>(void)`

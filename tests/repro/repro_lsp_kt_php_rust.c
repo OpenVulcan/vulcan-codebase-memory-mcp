@@ -31,7 +31,8 @@
  *     - Rust emits "lsp_*" (rust_emit_resolved_call, rust_lsp.c).
  *
  * RED vs GREEN — STATUS BOARD, not a pass/fail gate (runs only under
- *   make test-repro / bug-repro.yml, never the branch-protection ci-ok gate):
+ *   manual `make test-repro`, never the branch-protection ci-ok gate).
+ *   仅通过手工执行 `make test-repro` 运行，不进入分支保护 ci-ok 门禁。
  *     - GREEN = the strategy works end-to-end = a permanent regression guard.
  *     - RED   = the strategy is dropped, lands Module-sourced, or never reaches
  *               the graph. The TEST documents the exact gap for the fixer.
