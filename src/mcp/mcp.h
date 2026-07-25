@@ -18,6 +18,7 @@
 typedef struct cbm_store cbm_store_t; /* from store/store.h */
 struct cbm_watcher;                   /* from watcher/watcher.h */
 struct cbm_config;                    /* from cli/cli.h */
+struct cbm_managed_project_registry;  /* from daemon/managed_project_registry.h */
 
 /* ── JSON-RPC types ───────────────────────────────────────────── */
 
@@ -100,7 +101,44 @@ typedef enum {
      * write, so these are intentionally not named strictly read-only modes. */
     CBM_MCP_TOOL_PROFILE_ANALYSIS = 1,
     CBM_MCP_TOOL_PROFILE_SCOUT = 2,
+    /* Vulcan-managed surface: authorized read-only project tools plus private
+     * controller
+       operations. It is never inferred from the working directory.
+     * Vulcan
+       托管工具面：已授权只读项目工具与私有控制操作，绝不从工作目录推断。 */
+    CBM_MCP_TOOL_PROFILE_VULCAN = 3,
 } cbm_mcp_tool_profile_t;
+
+/* Managed index scheduling outcome returned by the daemon application.
+ * daemon application
+ * 返回的托管索引调度结果。 */
+typedef enum {
+    CBM_MCP_MANAGED_INDEX_FAILED = 0,
+    CBM_MCP_MANAGED_INDEX_STARTED,
+    CBM_MCP_MANAGED_INDEX_RUNNING,
+} cbm_mcp_managed_index_status_t;
+
+/* Daemon-owned side effects used after an atomic registry transition.
+ *
+ * 原子注册表转换后使用的 daemon 所有副作用接口。 */
+typedef struct {
+    /* Register or repair one shared watcher.
+     * 注册或修复一个共享 watcher。 */
+    bool (*watch_project)(void *context, const char *project_key, const char *canonical_root);
+    /* Remove one shared watcher without deleting its database.
+     * 移除一个共享
+     * watcher，但不删除其数据库。 */
+    void (*unwatch_project)(void *context, const char *project_key);
+    /* Schedule one daemon-owned physical index, coalescing duplicates.
+     * 调度一个 daemon
+     * 所有的物理索引，并合并重复任务。 */
+    cbm_mcp_managed_index_status_t (*schedule_index)(void *context, const char *project_key,
+                                                     const char *canonical_root, bool force);
+    /* Cancel only the registry-owned index for a removed project.
+     *
+     * 仅取消已移除项目由注册表拥有的索引。 */
+    void (*cancel_index)(void *context, const char *project_key);
+} cbm_mcp_managed_ops_t;
 
 /* Parse the process-level tool-profile flag. Explicit malformed or unknown
  * values fail closed with -1; absence selects the full default surface. */
@@ -130,6 +168,33 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
 /* Select the tool surface exposed by tools/list and enforced by dispatch. */
 void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile_t profile);
+
+/* Bind one daemon-level Vulcan registry and its side-effect callbacks.
+ * 绑定一个 daemon 级
+ * Vulcan
+ * 注册表及其副作用回调。
+ *
+ * Parameters:
+ * - srv: session-local MCP server.
+ * -
+ * registry: daemon-owned shared registry.
+ * - operations: daemon-owned callback table borrowed for
+ * the
+ * server lifetime.
+ * - context: opaque callback context.
+ * 参数：
+ * - srv：session 本地
+ * MCP
+ * 服务。
+ * - registry：daemon 拥有的共享注册表。
+ * -
+ * operations：在服务生命周期内借用的
+ * daemon 回调表。
+ * - context：不透明回调上下文。
+ */
+void cbm_mcp_server_set_vulcan_managed(cbm_mcp_server_t *srv,
+                                       struct cbm_managed_project_registry *registry,
+                                       const cbm_mcp_managed_ops_t *operations, void *context);
 
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);

@@ -82,11 +82,13 @@ valid_vendored_path() {
     [[ "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *$'\t'* ]] || return 1
 }
 
+# Hash one vendored C/header file after canonical CRLF-to-LF conversion; accepts the file path and prints a validated SHA-256 digest.
+# 将一个 vendored C/头文件按 CRLF 到 LF 规范化后计算哈希；接收文件路径并输出已校验的 SHA-256 摘要。
 hash_file() {
     local file="$1"
     local output
     local hash
-    if ! output="$("${SHA_CMD[@]}" "$file")"; then
+    if ! output="$(sed 's/\r$//' "$file" | "${SHA_CMD[@]}")"; then
         return 1
     fi
     hash="${output%% *}"
@@ -124,6 +126,9 @@ done < "$VENDORED_FILES"
 while IFS=' ' read -r expected_hash filepath || [[ -n "$expected_hash$filepath" ]]; do
     [[ -z "$expected_hash" && -z "$filepath" ]] && continue
     filepath="${filepath#"${filepath%%[![:space:]]*}"}"
+    # Remove the carriage return added by native Windows checkouts before validating the confined path.
+    # 在校验受限路径前移除 Windows 原生检出添加的回车符。
+    filepath="${filepath%$'\r'}"
 
     if [[ ! "$expected_hash" =~ ^[[:xdigit:]]{64}$ ]] ||
        ! valid_vendored_path "$filepath"; then

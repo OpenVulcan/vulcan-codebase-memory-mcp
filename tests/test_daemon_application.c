@@ -307,6 +307,31 @@ TEST(daemon_application_new_session_does_not_retain_initial_store) {
     PASS();
 }
 
+TEST(daemon_application_managed_mode_is_not_implicitly_permanent) {
+    cbm_daemon_application_config_t config = {
+        .vulcan_managed = true,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 301);
+
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    cbm_daemon_runtime_application_session_t *late_session = app_test_open(&callbacks, 302);
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    bool freed = application && cbm_daemon_application_free(application);
+
+    ASSERT_NOT_NULL(application);
+    ASSERT_NOT_NULL(session);
+    ASSERT_NULL(late_session);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(freed);
+    PASS();
+}
+
 TEST(daemon_application_request_cancel_is_scoped_to_exact_token) {
     char root[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-request-cancel-XXXXXX", cbm_tmpdir());
@@ -4870,8 +4895,400 @@ TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained) {
     PASS();
 }
 
+/*
+ * Verify managed watcher ownership survives every session cancellation and
+ * close, and a new
+ * session can reuse all three registered projects.
+ * 验证托管 watcher 所有权在所有
+ * session 取消与关闭后仍然保留，
+ * 且新 session
+ * 可以继续复用三个已注册项目。
+
+ */
+TEST(daemon_application_explicit_permanent_managed_watchers_outlive_sessions) {
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_grace = getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    char *saved_grace_copy = saved_grace ? cbm_strdup(saved_grace) : NULL;
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-managed-cache-XXXXXX", cbm_tmpdir());
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    bool environment_ready = cache_ready && (!saved_cache || saved_cache_copy) &&
+                             (!saved_grace || saved_grace_copy) &&
+                             cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1) == 0;
+
+    /* Managed roots, storage keys, and published databases.
+     *
+     * 托管根路径、存储键和已发布数据库。 */
+    char roots[3][APP_TEST_PATH_CAP] = {{0}};
+    char canonical[3][APP_TEST_PATH_CAP] = {{0}};
+    char database_paths[3][APP_TEST_PATH_CAP] = {{0}};
+    char *projects[3] = {0};
+    bool projects_ready = environment_ready;
+    for (size_t index = 0U; index < 3U && projects_ready; index++) {
+        (void)snprintf(roots[index], sizeof(roots[index]), "%s/cbm-app-managed-%zu-XXXXXX",
+                       cbm_tmpdir(), index + 1U);
+        projects_ready =
+            cbm_mkdtemp(roots[index]) != NULL &&
+            cbm_canonical_path(roots[index], canonical[index], sizeof(canonical[index]));
+        if (!projects_ready) {
+            break;
+        }
+        cbm_normalize_path_sep(canonical[index]);
+        projects[index] = cbm_project_name_from_path(canonical[index]);
+        projects_ready = projects[index] &&
+                         snprintf(database_paths[index], sizeof(database_paths[index]), "%s/%s.db",
+                                  cache, projects[index]) < (int)sizeof(database_paths[index]);
+        cbm_store_t *seed = projects_ready ? cbm_store_open_path(database_paths[index]) : NULL;
+        projects_ready = seed && cbm_store_upsert_project(seed, projects[index],
+                                                          canonical[index]) == CBM_STORE_OK;
+        cbm_store_close(seed);
+    }
+
+    cbm_store_t *watch_store = projects_ready ? cbm_store_open_memory() : NULL;
+    cbm_watcher_t *watcher =
+        watch_store ? cbm_watcher_new(watch_store, app_test_index_noop, NULL) : NULL;
+    /* Controllable worker used to remove a root before terminal publication.
+     *
+     * 用于在终态发布前移除根路径的可控 worker。 */
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .watcher = watcher,
+        .worker_ops = &worker_ops,
+        .vulcan_managed = true,
+    };
+    cbm_daemon_application_t *application = watcher ? cbm_daemon_application_new(&config) : NULL;
+    if (application) {
+        cbm_daemon_application_set_permanent(application, true);
+    }
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *first =
+        application ? app_test_open(&callbacks, 401) : NULL;
+    cbm_daemon_runtime_application_session_t *second =
+        application ? app_test_open(&callbacks, 402) : NULL;
+
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    bool context_encoded =
+        first && second &&
+        app_test_context_request_options(canonical[0], canonical[0], CBM_MCP_TOOL_PROFILE_VULCAN,
+                                         NULL, NULL, &context, &context_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool contexts_set =
+        context_encoded && app_test_request(&callbacks, first, context, context_length, &response,
+                                            &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    contexts_set =
+        contexts_set && app_test_request(&callbacks, second, context, context_length, &response,
+                                         &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+
+    char sync_arguments[32768];
+    bool sync_encoded =
+        contexts_set && snprintf(sync_arguments, sizeof(sync_arguments),
+                                 "{\"contract\":\"%s\",\"generation\":1,\"projects\":["
+                                 "{\"project_id\":\"project-1\",\"pwd\":\"%s\"},"
+                                 "{\"project_id\":\"project-2\",\"pwd\":\"%s\"},"
+                                 "{\"project_id\":\"project-3\",\"pwd\":\"%s\"}]}",
+                                 CBM_VULCAN_MANAGED_CONTRACT, canonical[0], canonical[1],
+                                 canonical[2]) < (int)sizeof(sync_arguments);
+    uint8_t *sync_request = NULL;
+    uint32_t sync_request_length = 0;
+    bool sync_request_encoded =
+        sync_encoded && app_test_tool_request("vulcan_sync_projects", sync_arguments, &sync_request,
+                                              &sync_request_length);
+    cbm_daemon_runtime_application_status_t sync_status =
+        sync_request_encoded ? app_test_request(&callbacks, first, sync_request,
+                                                sync_request_length, &response, &response_length)
+                             : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool sync_committed = response && strstr((const char *)response, "\\\"project_count\\\":3") &&
+                          strstr((const char *)response, "\\\"failed\\\":0");
+    free(response);
+    response = NULL;
+    int initial_watchers = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    /* A sustained missing root must become offline without pruning its
+     * watcher entry or
+     * published database.
+     * 持续缺失的根路径必须转为离线，但不得清理
+     * watcher 条目或已发布数据库。 */
+    bool missing_root_removed = initial_watchers == 3 && cbm_rmdir(roots[0]) == 0;
+    for (int miss = 0; missing_root_removed && miss < 3; miss++) {
+        cbm_watcher_touch(watcher, projects[0]);
+        (void)cbm_watcher_poll_once(watcher);
+    }
+    char status_arguments[8192];
+    bool status_encoded =
+        missing_root_removed &&
+        snprintf(status_arguments, sizeof(status_arguments),
+                 "{\"contract\":\"%s\",\"project_id\":\"project-1\",\"pwd\":\"%s\"}",
+                 CBM_VULCAN_MANAGED_CONTRACT, canonical[0]) < (int)sizeof(status_arguments);
+    uint8_t *status_request = NULL;
+    uint32_t status_request_length = 0;
+    status_encoded =
+        status_encoded && app_test_tool_request("vulcan_project_status", status_arguments,
+                                                &status_request, &status_request_length);
+    cbm_daemon_runtime_application_status_t offline_status =
+        status_encoded ? app_test_request(&callbacks, first, status_request, status_request_length,
+                                          &response, &response_length)
+                       : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool missing_root_retained =
+        response && strstr((const char *)response, "\\\"lifecycle\\\":\\\"offline\\\"") &&
+        cbm_watcher_watch_count(watcher) == 3 && cbm_file_exists(database_paths[0]);
+    free(response);
+    response = NULL;
+
+    callbacks.session_cancel(callbacks.context, first);
+    int after_first_cancel = cbm_watcher_watch_count(watcher);
+    callbacks.session_close(callbacks.context, first);
+    first = NULL;
+    int after_first_close = cbm_watcher_watch_count(watcher);
+    callbacks.session_cancel(callbacks.context, second);
+    int after_second_cancel = cbm_watcher_watch_count(watcher);
+    callbacks.session_close(callbacks.context, second);
+    second = NULL;
+    int after_last_close = cbm_watcher_watch_count(watcher);
+
+    cbm_daemon_runtime_application_session_t *replacement =
+        application ? app_test_open(&callbacks, 403) : NULL;
+    /* Context frame anchored to a root that remains online.
+     *
+     * 锚定到仍在线根路径的上下文帧。
+     */
+    uint8_t *replacement_context_request = NULL;
+    uint32_t replacement_context_length = 0;
+    bool replacement_context_encoded =
+        replacement && app_test_context_request_options(
+                           canonical[2], canonical[2], CBM_MCP_TOOL_PROFILE_VULCAN, NULL, NULL,
+                           &replacement_context_request, &replacement_context_length);
+    bool replacement_context =
+        replacement_context_encoded &&
+        app_test_request(&callbacks, replacement, replacement_context_request,
+                         replacement_context_length, &response,
+                         &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    char query_arguments[8192];
+    (void)snprintf(query_arguments, sizeof(query_arguments),
+                   "{\"_vulcan\":{\"contract\":\"%s\","
+                   "\"project_id\":\"project-3\",\"pwd\":\"%s\","
+                   "\"session_id\":\"replacement-session\"}}",
+                   CBM_VULCAN_MANAGED_CONTRACT, canonical[2]);
+    uint8_t *query_request = NULL;
+    uint32_t query_request_length = 0;
+    bool query_encoded =
+        replacement_context && app_test_tool_request("get_graph_schema", query_arguments,
+                                                     &query_request, &query_request_length);
+    cbm_daemon_runtime_application_status_t query_status =
+        query_encoded ? app_test_request(&callbacks, replacement, query_request,
+                                         query_request_length, &response, &response_length)
+                      : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool replacement_routed = response &&
+                              strstr((const char *)response, "\"isError\":true") == NULL &&
+                              cbm_watcher_watch_count(watcher) == 3;
+    free(response);
+    response = NULL;
+
+    /*
+     * Complete a managed reindex after its root disappears and require the
+     * terminal
+     * publisher to preserve the offline lifecycle.
+     *
+     *
+     * 在托管重建索引期间移除根路径，并要求终态发布器保留离线生命周期。
+
+     */
+    char reindex_arguments[8192];
+    bool reindex_encoded =
+        snprintf(reindex_arguments, sizeof(reindex_arguments),
+                 "{\"contract\":\"%s\",\"project_id\":\"project-2\",\"pwd\":\"%s\"}",
+                 CBM_VULCAN_MANAGED_CONTRACT, canonical[1]) < (int)sizeof(reindex_arguments);
+    uint8_t *reindex_request = NULL;
+    uint32_t reindex_request_length = 0;
+    reindex_encoded =
+        reindex_encoded && app_test_tool_request("vulcan_reindex_project", reindex_arguments,
+                                                 &reindex_request, &reindex_request_length);
+    cbm_daemon_runtime_application_status_t reindex_status =
+        reindex_encoded ? app_test_request(&callbacks, replacement, reindex_request,
+                                           reindex_request_length, &response, &response_length)
+                        : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool reindex_started =
+        response && strstr((const char *)response, "\\\"status\\\":\\\"started\\\"");
+    free(response);
+    response = NULL;
+    uint64_t worker_start_deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (atomic_load(&fake.starts) == 0 && cbm_now_ms() < worker_start_deadline) {
+        cbm_usleep(1000);
+    }
+    bool root_removed_during_index = atomic_load(&fake.starts) == 1 && cbm_rmdir(roots[1]) == 0;
+    atomic_store(&fake.allow_completion, true);
+    uint64_t worker_finish_deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (cbm_daemon_application_active_jobs(application) != 0U &&
+           cbm_now_ms() < worker_finish_deadline) {
+        cbm_usleep(1000);
+    }
+    bool reindex_finished = cbm_daemon_application_active_jobs(application) == 0U;
+
+    char job_status_arguments[8192];
+    bool job_status_encoded =
+        reindex_finished &&
+        snprintf(job_status_arguments, sizeof(job_status_arguments),
+                 "{\"contract\":\"%s\",\"project_id\":\"project-2\",\"pwd\":\"%s\"}",
+                 CBM_VULCAN_MANAGED_CONTRACT, canonical[1]) < (int)sizeof(job_status_arguments);
+    uint8_t *job_status_request = NULL;
+    uint32_t job_status_request_length = 0;
+    job_status_encoded = job_status_encoded &&
+                         app_test_tool_request("vulcan_project_status", job_status_arguments,
+                                               &job_status_request, &job_status_request_length);
+    cbm_daemon_runtime_application_status_t job_status =
+        job_status_encoded
+            ? app_test_request(&callbacks, replacement, job_status_request,
+                               job_status_request_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool completed_offline = response &&
+                             strstr((const char *)response, "\\\"lifecycle\\\":\\\"offline\\\"") &&
+                             strstr((const char *)response, "\\\"index_revision\\\":1");
+    free(response);
+    response = NULL;
+
+    /*
+     * Remove the offline project authoritatively, then prove a stale watcher
+     * callback
+     * cannot recreate a physical job after its cancellation window.
+     *
+     *
+     * 权威移除离线项目后，验证过期 watcher 回调无法在取消窗口结束后
+ *
+     * 重新创建物理任务。
+
+     */
+    bool removal_sync_encoded =
+        replacement && snprintf(sync_arguments, sizeof(sync_arguments),
+                                "{\"contract\":\"%s\",\"generation\":2,\"projects\":["
+                                "{\"project_id\":\"project-2\",\"pwd\":\"%s\"},"
+                                "{\"project_id\":\"project-3\",\"pwd\":\"%s\"}]}",
+                                CBM_VULCAN_MANAGED_CONTRACT, canonical[1],
+                                canonical[2]) < (int)sizeof(sync_arguments);
+    uint8_t *removal_sync_request = NULL;
+    uint32_t removal_sync_request_length = 0;
+    removal_sync_encoded =
+        removal_sync_encoded &&
+        app_test_tool_request("vulcan_sync_projects", sync_arguments, &removal_sync_request,
+                              &removal_sync_request_length);
+    cbm_daemon_runtime_application_status_t removal_sync_status =
+        removal_sync_encoded
+            ? app_test_request(&callbacks, replacement, removal_sync_request,
+                               removal_sync_request_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool removal_committed = response && strstr((const char *)response, "\\\"generation\\\":2") &&
+                             strstr((const char *)response, "\\\"removed\\\":1") &&
+                             cbm_watcher_watch_count(watcher) == 1;
+    free(response);
+    response = NULL;
+    int stale_watcher_result =
+        removal_committed
+            ? cbm_daemon_application_watcher_index(projects[0], canonical[0], application)
+            : 0;
+    bool stale_watcher_rejected = removal_committed && stale_watcher_result != 0 &&
+                                  cbm_daemon_application_active_jobs(application) == 0U;
+    if (replacement) {
+        callbacks.session_close(callbacks.context, replacement);
+    }
+
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    bool freed = application && cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(watch_store);
+    free(context);
+    free(sync_request);
+    free(status_request);
+    free(replacement_context_request);
+    free(query_request);
+    free(reindex_request);
+    free(job_status_request);
+    free(removal_sync_request);
+    for (size_t index = 0U; index < 3U; index++) {
+        (void)cbm_unlink(database_paths[index]);
+        if (roots[index][0]) {
+            (void)cbm_rmdir(roots[index]);
+        }
+        free(projects[index]);
+    }
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
+    if (saved_grace_copy) {
+        (void)cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_grace_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_WATCHER_PRUNE_GRACE_S");
+    }
+    free(saved_grace_copy);
+    if (cache_ready) {
+        (void)th_rmtree(cache);
+    }
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(projects_ready);
+    ASSERT_TRUE(context_encoded);
+    ASSERT_TRUE(contexts_set);
+    ASSERT_TRUE(sync_request_encoded);
+    ASSERT_EQ(sync_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(sync_committed);
+    ASSERT_EQ(initial_watchers, 3);
+    ASSERT_TRUE(missing_root_removed);
+    ASSERT_TRUE(status_encoded);
+    ASSERT_EQ(offline_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(missing_root_retained);
+    ASSERT_EQ(after_first_cancel, 3);
+    ASSERT_EQ(after_first_close, 3);
+    ASSERT_EQ(after_second_cancel, 3);
+    ASSERT_EQ(after_last_close, 3);
+    ASSERT_TRUE(replacement_context_encoded);
+    ASSERT_TRUE(replacement_context);
+    ASSERT_TRUE(query_encoded);
+    ASSERT_EQ(query_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(replacement_routed);
+    ASSERT_TRUE(reindex_encoded);
+    ASSERT_EQ(reindex_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(reindex_started);
+    ASSERT_TRUE(root_removed_during_index);
+    ASSERT_TRUE(reindex_finished);
+    ASSERT_TRUE(job_status_encoded);
+    ASSERT_EQ(job_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(completed_offline);
+    ASSERT_TRUE(removal_sync_encoded);
+    ASSERT_EQ(removal_sync_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(removal_committed);
+    ASSERT_TRUE(stale_watcher_rejected);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(freed);
+    PASS();
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
+    RUN_TEST(daemon_application_managed_mode_is_not_implicitly_permanent);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
@@ -4918,4 +5335,5 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
+    RUN_TEST(daemon_application_explicit_permanent_managed_watchers_outlive_sessions);
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# build.sh — Clean build of production binary (standard or with UI).
+# build.sh - Clean build of the dedicated Vulcan production binary.
+# build.sh - 清理并构建 Vulcan 专版生产二进制。
 #
 # Usage:
-#   scripts/build.sh                              # Standard binary
-#   scripts/build.sh --with-ui                    # Binary with embedded UI
+#   scripts/build.sh                              # Dedicated sidecar
+#   scripts/build.sh --with-ui                    # Dedicated sidecar with embedded UI
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
@@ -105,4 +106,4 @@ else
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
-echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="
+echo "=== Build complete: ${BUILD_DIR}/vulcan-codebase-memory-mcp ==="

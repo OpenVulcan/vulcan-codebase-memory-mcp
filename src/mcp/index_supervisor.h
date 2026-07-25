@@ -40,6 +40,7 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 #define CBM_INDEX_WORKER_QUARANTINE_ARG "--index-worker-quarantine"
 #define CBM_INDEX_WORKER_MEMORY_BUDGET_ARG "--index-worker-memory-budget-bytes"
 #define CBM_INDEX_WORKER_BUILD_ARG "--index-worker-build"
+#define CBM_INDEX_WORKER_VULCAN_MANAGED_ARG "--index-worker-vulcan-managed"
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH 64U
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE 65U
 void cbm_index_set_worker_role_options(bool is_worker, const char *response_out, bool single_thread,
@@ -63,6 +64,10 @@ typedef struct {
     const char *marker_file;
     const char *quarantine_file;
     size_t memory_budget_bytes;
+    /* Use the dedicated Vulcan coordination product identity.
+     * 使用独立的 Vulcan
+     * 协调产品身份。 */
+    bool vulcan_managed;
 } cbm_index_worker_invocation_t;
 
 typedef enum {
@@ -91,6 +96,13 @@ const char *cbm_index_worker_argv_status_message(cbm_index_worker_argv_status_t 
  * its suites instead, producing recursive spawn chains (11-min hangs; kernel
  * VM-map pressure during the 2026-07-04 host panics). */
 void cbm_index_supervisor_mark_host(void);
+
+/*
+ * Select the immutable product identity inherited by new index workers.
+ * 选择新索引
+ * worker 继承的不可变产品身份。
+ */
+void cbm_index_supervisor_set_vulcan_managed(bool vulcan_managed);
 
 /* True when handle_index_repository must wrap the run in a supervised child:
  * this process called cbm_index_supervisor_mark_host() (i.e. it IS the real

@@ -15,6 +15,9 @@ UseTab: Never
 
 # Column limit
 ColumnLimit: 100
+# Preserve bilingual comment lines because clang-format's display-width
+# calculation can repeatedly reflow CJK text on Windows.
+ReflowComments: false
 
 # Braces: K&R style (same line)
 BreakBeforeBraces: Attach

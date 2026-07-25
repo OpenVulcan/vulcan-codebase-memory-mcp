@@ -1,15 +1,16 @@
-# Reusable: build binaries (standard + UI) on all platforms
-name: Build
+# Reusable native build for the dedicated Vulcan Codebase Memory sidecar.
+# Vulcan Codebase Memory 专版 Sidecar 的可复用原生构建。
+name: Build Vulcan CBM
 
 on:
   workflow_call:
     inputs:
       version:
-        description: 'Version string (e.g. v0.8.0)'
+        description: "Version string compiled into every native artifact"
         type: string
-        default: ''
+        default: "dev"
       attest:
-        description: 'Generate build provenance attestations for release artifacts'
+        description: "Generate build provenance attestations"
         type: boolean
         default: false
 
@@ -19,130 +20,38 @@ permissions:
   attestations: write
 
 jobs:
-  build-unix:
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            cc: cc
-            cxx: c++
-    runs-on: ${{ matrix.os }}
-    # Every leg is BLOCKING — no continue-on-error. The darwin-amd64 binary
-    # built on macos-15-intel must ship with every release; if that runner is
-    # unavailable the build fails loudly rather than silently publishing a
-    # release with no Intel macOS binary (a user-reported gap). macos-15-intel
-    # is GitHub's supported Intel image through Aug 2027 (the last x86_64 macOS
-    # runner); revisit the Intel leg before that retirement.
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+            shell_kind: unix
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+            shell_kind: unix
+          - runner: macos-15-intel
+            platform: macos-x86_64
+            shell_kind: unix
+          - runner: macos-14
+            platform: macos-aarch64
+            shell_kind: unix
+          - runner: windows-2022
+            platform: windows-x86_64
+            shell_kind: windows
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        env:
-          VERSION: ${{ inputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
-          else
-            scripts/build.sh "CC=$CC" "CXX=$CXX"
-          fi
-
-      - name: Ad-hoc sign macOS binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Archive standard binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-
-      - name: Build UI binary
-        env:
-          VERSION: ${{ inputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
-          else
-            scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
-          fi
-
-      - name: Ad-hoc sign macOS UI binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Frontend integrity scan
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-ui.sh
-
-      - name: Archive UI binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - name: Attest UI binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "*.tar.gz"
-
-  build-windows:
-    runs-on: windows-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+      - name: Configure Windows CLANG64
+        if: matrix.shell_kind == 'windows'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64
           path-type: inherit
@@ -150,245 +59,103 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
             make
-            zip
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
+      - name: Build dedicated Unix sidecar
+        if: matrix.shell_kind == 'unix'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/build.sh --version "$VERSION"
 
-      - name: Build standard binary
+      - name: Sign dedicated macOS sidecar
+        if: startsWith(matrix.platform, 'macos-')
+        run: codesign --sign - --force build/c/vulcan-codebase-memory-mcp
+
+      - name: Build dedicated Windows sidecar
+        if: matrix.shell_kind == 'windows'
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
+        run: scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
 
-      - name: Archive standard binary
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
-          PAYLOAD=build/c/codebase-memory-mcp
-          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-amd64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-windows-amd64.zip
-
-      - name: Build UI binary
-        shell: msys2 {0}
+      - name: Verify dedicated Unix product
+        if: matrix.shell_kind == 'unix'
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
-          fi
+          test "$(build/c/vulcan-codebase-memory-mcp --version)" = \
+            "vulcan-codebase-memory-mcp ${VERSION#v}"
+          test ! -e build/c/codebase-memory-mcp
 
-      - name: Archive UI binary
-        shell: msys2 {0}
+      - name: Verify dedicated Windows product
+        if: matrix.shell_kind == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
-          PAYLOAD=build/c/codebase-memory-mcp
-          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-amd64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+          $ExpectedVersion = $env:VERSION.TrimStart("v")
+          $ActualVersion = (& .\build\c\vulcan-codebase-memory-mcp.exe --version | Out-String).Trim()
+          if ($ActualVersion -cne "vulcan-codebase-memory-mcp $ExpectedVersion") {
+              throw "Unexpected dedicated product version: $ActualVersion"
+          }
+          if (Test-Path -LiteralPath .\build\c\codebase-memory-mcp.exe) {
+              throw "Public Codebase Memory artifact must not be produced."
+          }
 
-      - name: Attest UI binary provenance
+      - name: Run Windows managed end-to-end test
+        if: matrix.shell_kind == 'windows'
+        shell: pwsh
+        run: >
+          .\scripts\test-vulcan-managed-windows.ps1
+          -Executable .\build\c\vulcan-codebase-memory-mcp.exe
+
+      - name: Package dedicated Unix runtime
+        if: matrix.shell_kind == 'unix'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${VERSION#v}"
+          PACKAGE_DIR="package-${PLATFORM}"
+          mkdir "$PACKAGE_DIR"
+          cp build/c/vulcan-codebase-memory-mcp "$PACKAGE_DIR/"
+          SHA256=$(shasum -a 256 "$PACKAGE_DIR/vulcan-codebase-memory-mcp" | awk '{print $1}')
+          printf '{\n  "protocol": "vulcan.codebase-memory/1",\n  "version": "%s",\n  "platform": "%s",\n  "executable": "vulcan-codebase-memory-mcp",\n  "sha256": "%s"\n}\n' \
+            "$VERSION" "$PLATFORM" "$SHA256" > "$PACKAGE_DIR/manifest.json"
+          tar -czf "vulcan-codebase-memory-mcp-${PLATFORM}.tar.gz" -C "$PACKAGE_DIR" \
+            vulcan-codebase-memory-mcp manifest.json
+
+      - name: Package dedicated Windows runtime
+        if: matrix.shell_kind == 'windows'
+        shell: pwsh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          $Version = $env:VERSION.TrimStart("v")
+          $PackageDirectory = Join-Path $PWD "package-$($env:PLATFORM)"
+          New-Item -ItemType Directory -Path $PackageDirectory | Out-Null
+          $DestinationBinary = Join-Path $PackageDirectory "vulcan-codebase-memory-mcp.exe"
+          Copy-Item .\build\c\vulcan-codebase-memory-mcp.exe $DestinationBinary
+          $Manifest = [ordered]@{
+              protocol = "vulcan.codebase-memory/1"
+              version = $Version
+              platform = $env:PLATFORM
+              executable = "vulcan-codebase-memory-mcp.exe"
+              sha256 = (Get-FileHash -Algorithm SHA256 $DestinationBinary).Hash.ToLowerInvariant()
+          }
+          $Manifest | ConvertTo-Json | Set-Content `
+              (Join-Path $PackageDirectory "manifest.json") -Encoding utf8NoBOM
+          Compress-Archive -Path "$PackageDirectory\*" `
+              -DestinationPath "vulcan-codebase-memory-mcp-$($env:PLATFORM).zip"
+
+      - name: Attest dedicated runtime
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
+          subject-path: vulcan-codebase-memory-mcp-${{ matrix.platform }}.*
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-windows-amd64
-          path: "*.zip"
-
-  build-windows-arm64:
-    # Native ARM64 Windows binary via the CLANGARM64 toolchain on the
-    # windows-11-arm runner (the same toolchain the test suite already
-    # exercises). Without it, ARM-Windows users fall back to the x86_64
-    # binary under emulation, and npm/pip on native-ARM Node/Python 404.
-    runs-on: windows-11-arm
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: CLANGARM64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-aarch64-clang
-            mingw-w64-clang-aarch64-zlib
-            make
-            zip
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
-
-      - name: Archive standard binary
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
-          PAYLOAD=build/c/codebase-memory-mcp
-          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-arm64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-windows-arm64.zip
-
-      - name: Build UI binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
-          fi
-
-      - name: Archive UI binary
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
-          PAYLOAD=build/c/codebase-memory-mcp
-          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
-          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-arm64.zip \
-            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Attest UI binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-ui-windows-arm64.zip
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-windows-arm64
-          path: "*.zip"
-
-  build-linux-portable:
-    # Fully static Linux binaries (gcc -static on Ubuntu).
-    # Runs on any Linux distro without shared library dependencies.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary (static)
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1
-          else
-            scripts/build.sh CC=gcc CXX=g++ STATIC=1
-          fi
-
-      - name: Verify static linking
-        run: |
-          file build/c/codebase-memory-mcp
-          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
-
-      - name: Archive standard binary
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
-
-      - name: Build UI binary (static)
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
-          else
-            scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
-          fi
-
-      - name: Archive UI binary
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - name: Attest UI binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-linux-${{ matrix.arch }}-portable
-          path: "*.tar.gz"
+          name: vulcan-cbm-${{ matrix.platform }}
+          path: vulcan-codebase-memory-mcp-${{ matrix.platform }}.*
+          if-no-files-found: error

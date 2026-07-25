@@ -210,6 +210,7 @@ DAEMON_SRCS = \
     src/daemon/version_cohort.c \
     src/daemon/service.c \
     src/daemon/runtime.c \
+    src/daemon/managed_project_registry.c \
     src/daemon/application.c \
     src/daemon/frontend.c \
     src/daemon/host.c \
@@ -393,6 +394,7 @@ TEST_MCP_SRCS = \
     tests/test_index_supervisor.c
 
 TEST_DAEMON_SRCS = \
+    tests/test_managed_project_registry.c \
     tests/test_daemon.c \
     tests/test_project_lock.c \
     tests/test_version_cohort.c \
@@ -549,6 +551,14 @@ ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS
 
 BUILD_DIR = build/c
 
+# Platform executable suffix used by build and verification targets.
+# 构建与验证目标使用的平台可执行文件后缀。
+PROGRAM_SUFFIX :=
+ifeq ($(IS_MINGW),yes)
+PROGRAM_SUFFIX := .exe
+endif
+CBM_PROGRAM := $(BUILD_DIR)/vulcan-codebase-memory-mcp$(PROGRAM_SUFFIX)
+
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
@@ -570,7 +580,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-launcher cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -764,8 +774,8 @@ test-tsan: $(BUILD_DIR)/test-runner-tsan
 # Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
 # an explicit Make invocation requires a clean rendezvous and fails rather than
 # silently skipping an occupied one. Deterministic C tests cover Windows IPC.
-test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
-	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
+test-daemon-smoke: $(CBM_PROGRAM)
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(CBM_PROGRAM)
 
 # ── Production binary ────────────────────────────────────────────
 
@@ -803,38 +813,15 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-WINDOWS_LAUNCHER_TARGET :=
-ifeq ($(IS_MINGW),yes)
-WINDOWS_LAUNCHER_TARGET := $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
-endif
-
-# Keep the explicit .exe target even on non-Windows hosts: packaging contracts
-# and native-Windows invocations share this single artifact name.  A non-Windows
-# direct invocation builds a diagnostic stub and is not part of `cbm`.
-$(BUILD_DIR)/codebase-memory-mcp-launcher.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
-		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
-		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
-
-# Native-Windows compatibility fixture: its launcher ABI intentionally does
-# not fit the production payload's default [1,1] range.  It is never packaged.
-$(BUILD_DIR)/codebase-memory-mcp-launcher-abi2.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -DCBM_WINDOWS_LAUNCHER_ABI_CURRENT=2 -o $@ \
-		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
-		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
-
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
+$(CBM_PROGRAM): $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -DCBM_VULCAN_PRODUCT=1 -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp $(WINDOWS_LAUNCHER_TARGET)
-	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
-
-cbm-launcher: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
-	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe"
+cbm: $(CBM_PROGRAM)
+	@echo "Built: $(CBM_PROGRAM)"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
@@ -851,14 +838,14 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(WINDOWS_LAUNCHER_TARGET)
-	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
+cbm-with-ui: embed $(OBJS_VENDORED_PROD)
+	$(CC) $(CFLAGS_PROD) -DCBM_VULCAN_PRODUCT=1 -o $(CBM_PROGRAM) \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
-	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
+	@echo "Built with UI: $(CBM_PROGRAM)"
 
 clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
@@ -948,10 +935,10 @@ lint-ci: lint-cppcheck lint-format lint-no-suppress
 security: cbm
 	@echo "=== Running security audit suite ==="
 	scripts/security-audit.sh
-	scripts/security-strings.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-strings.sh $(CBM_PROGRAM)
 	scripts/security-ui.sh
-	scripts/security-install.sh $(BUILD_DIR)/codebase-memory-mcp
-	scripts/security-network.sh $(BUILD_DIR)/codebase-memory-mcp
-	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-install.sh $(CBM_PROGRAM)
+	scripts/security-network.sh $(CBM_PROGRAM)
+	scripts/security-fuzz.sh $(CBM_PROGRAM)
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="

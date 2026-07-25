@@ -23,10 +23,26 @@ TOTAL=0
 
 # Temp directory for input files (avoids pipe/stdin issues with timeout)
 FUZZ_TMPDIR=$(mktemp -d)
-trap 'rm -rf "$FUZZ_TMPDIR"' EXIT
 FUZZ_HOME="$FUZZ_TMPDIR/home"
 FUZZ_CACHE="$FUZZ_TMPDIR/cache"
 mkdir -p "$FUZZ_HOME" "$FUZZ_CACHE"
+
+# Remove the test-owned directory after Windows releases daemon file handles; accepts no parameters and returns zero only when cleanup succeeds.
+# Windows 释放 daemon 文件句柄后删除测试专用目录；不接收参数，仅在清理成功时返回零。
+cleanup_fuzz_tmpdir() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if rm -rf "$FUZZ_TMPDIR" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    echo "FAIL: unable to remove fuzz temp directory: $FUZZ_TMPDIR" >&2
+    return 1
+}
+
+trap cleanup_fuzz_tmpdir EXIT
 
 # Helper: send a payload to the MCP server and check it doesn't crash.
 # Uses temp file + perl alarm for portable timeout (works on macOS + Linux).

@@ -210,6 +210,10 @@ cbm_index_worker_argv_status_t cbm_index_worker_parse_process_argv(
         parsed.quarantine_file = argv[next + 1];
         next += 2;
     }
+    if (next < argc && argv[next] && strcmp(argv[next], CBM_INDEX_WORKER_VULCAN_MANAGED_ARG) == 0) {
+        parsed.vulcan_managed = true;
+        next++;
+    }
     if (next != argc) {
         return CBM_INDEX_WORKER_ARGV_INVALID;
     }
@@ -261,9 +265,18 @@ int cbm_index_supervisor_spawn_st_count(void) {
 /* #845: opt-in host mark — see the header. Set once from the real binary's
  * main(); embedders never set it, so should_wrap() stays false for them. */
 static bool g_host_marked = false;
+/* Immutable process product mode copied into child argv.
+ * 写入子进程 argv
+ * 的不可变进程产品模式。
+ */
+static bool g_vulcan_managed = false;
 
 void cbm_index_supervisor_mark_host(void) {
     g_host_marked = true;
+}
+
+void cbm_index_supervisor_set_vulcan_managed(bool vulcan_managed) {
+    g_vulcan_managed = vulcan_managed;
 }
 
 bool cbm_index_supervisor_should_wrap(void) {
@@ -654,6 +667,9 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     if (quarantine_file && quarantine_file[0]) {
         argv[argc++] = CBM_INDEX_WORKER_QUARANTINE_ARG;
         argv[argc++] = quarantine_file;
+    }
+    if (g_vulcan_managed) {
+        argv[argc++] = CBM_INDEX_WORKER_VULCAN_MANAGED_ARG;
     }
     argv[argc] = NULL;
 

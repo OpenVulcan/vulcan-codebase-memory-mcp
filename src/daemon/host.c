@@ -77,6 +77,9 @@ typedef struct {
 struct host_state {
     /* Mirrors cbm_daemon_host_config_t.permanent for prepare-time consumers. */
     bool permanent;
+    /* Explicit Vulcan-managed product mode.
+     * 显式 Vulcan 托管产品模式。 */
+    bool vulcan_managed;
     cbm_daemon_application_t *application;
     cbm_watcher_t *watcher;
     cbm_store_t *watch_store;
@@ -429,6 +432,9 @@ static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool for
     if (!host || !host->http_ops) {
         return;
     }
+    if (host->vulcan_managed) {
+        return;
+    }
     if (!force_config_load && host->http_config_loaded && now_ms < host->http_next_config_load_ms) {
         return;
     }
@@ -581,6 +587,7 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         .config = host->runtime_config,
         .aggregate_memory_budget_bytes = aggregate_memory_budget_bytes,
         .project_locks = host->project_locks,
+        .vulcan_managed = host->vulcan_managed,
     };
     host->application = cbm_daemon_application_new(&application_config);
     if (host->application && host->permanent) {
@@ -991,6 +998,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
 
     host_state_t host = {0};
     host.permanent = config->permanent;
+    host.vulcan_managed = config->vulcan_managed;
     if (!host_state_prepare(&host, config->endpoint)) {
         cbm_log_error("daemon.start_failed", "component", "application");
         host_state_free(&host);

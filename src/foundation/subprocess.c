@@ -730,7 +730,16 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
 
     PROCESS_INFORMATION child;
     ZeroMemory(&child, sizeof(child));
-    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
+    /*
+     * Workers are supervised background processes and must never request a
+     * console
+     * from the user's configured Windows terminal.
+     * Worker
+     * 是受监督的后台进程，绝不能向用户配置的 Windows 终端申请控制台。
+
+     */
+    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
+                  CREATE_NO_WINDOW;
     BOOL created = CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, NULL, NULL,
                                   &startup.StartupInfo, &child);
     cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);

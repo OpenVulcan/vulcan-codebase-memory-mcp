@@ -74,8 +74,22 @@ static cbm_daemon_build_identity_t bootstrap_identity(const char *version, const
 static bool bootstrap_endpoint_fixture_start(bootstrap_endpoint_fixture_t *fixture,
                                              const char *tag) {
     memset(fixture, 0, sizeof(*fixture));
+    /* Use the current user's private application-data tree on Windows because
+     * MSYS2 exports
+     * a shared TMP directory that the IPC security policy must reject.
+     * Windows
+     * 下使用当前用户私有的应用数据目录，因为 MSYS2 导出的共享 TMP
+     * 目录必须被
+     * IPC 安全策略拒绝。 */
+    const char *temporary_parent = cbm_tmpdir();
+#ifdef _WIN32
+    const char *local_app_data = getenv("LOCALAPPDATA");
+    if (local_app_data && local_app_data[0] != '\0') {
+        temporary_parent = local_app_data;
+    }
+#endif
     int written = snprintf(fixture->parent, sizeof(fixture->parent), "%s/cbm-bootstrap-%s-XXXXXX",
-                           cbm_tmpdir(), tag);
+                           temporary_parent, tag);
     if (written <= 0 || written >= (int)sizeof(fixture->parent) || !cbm_mkdtemp(fixture->parent)) {
         return false;
     }
@@ -83,6 +97,8 @@ static bool bootstrap_endpoint_fixture_start(bootstrap_endpoint_fixture_t *fixtu
     const char *runtime_dir =
         fixture->endpoint ? cbm_daemon_ipc_endpoint_runtime_dir(fixture->endpoint) : NULL;
     if (!runtime_dir) {
+        fprintf(stderr, "bootstrap endpoint fixture '%s' failed: %s\n", fixture->parent,
+                cbm_daemon_ipc_validation_detail());
         return false;
     }
     written = snprintf(fixture->runtime_dir, sizeof(fixture->runtime_dir), "%s", runtime_dir);
@@ -220,8 +236,7 @@ static bool bootstrap_fake_spawn(void *opaque, const cbm_daemon_bootstrap_launch
     bootstrap_fake_ops_t *fake = opaque;
     /* Client bootstrap must only ever spawn the EPHEMERAL two-argument
      * shape; the permanent shape belongs exclusively to `daemon start`. */
-    bool exact = spec && spec->argc == 2U && spec->argv[0] &&
-                 spec->argv[1] && !spec->argv[2] &&
+    bool exact = spec && spec->argc == 2U && spec->argv[0] && spec->argv[1] && !spec->argv[2] &&
                  strcmp(spec->argv[1], CBM_DAEMON_INTERNAL_ARG) == 0 && spec->detached &&
                  !spec->inherit_standard_handles && !spec->use_shell &&
                  atomic_load(&fake->handoff_count) > 0 && atomic_load(&fake->lock_held) == 1;
@@ -275,6 +290,39 @@ TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients) {
     ASSERT_EQ(classify(1, plain), CBM_DAEMON_PROCESS_MCP_CLIENT);
     ASSERT_EQ(classify(3, ui), CBM_DAEMON_PROCESS_MCP_CLIENT);
     ASSERT_TRUE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_MCP_CLIENT));
+    PASS();
+}
+
+/*
+ * Keep the managed daemon grammar and product key separate from public CBM.
+ * 保持托管
+ * daemon 语法和产品键与公开 CBM 相互独立。
+ */
+TEST(daemon_bootstrap_vulcan_product_identity_is_explicit_and_separate) {
+    char *managed_client[] = {"codebase-memory-mcp", "--vulcan-managed", NULL};
+    char *managed_daemon[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG,
+                              CBM_DAEMON_VULCAN_MANAGED_ARG, NULL};
+    char *permanent_managed[] = {"codebase-memory-mcp", CBM_DAEMON_INTERNAL_ARG,
+                                 CBM_DAEMON_PERMANENT_ARG, CBM_DAEMON_VULCAN_MANAGED_ARG, NULL};
+    ASSERT_EQ(classify(2, managed_client), CBM_DAEMON_PROCESS_MCP_CLIENT);
+    ASSERT_EQ(classify(3, managed_daemon), CBM_DAEMON_PROCESS_DAEMON);
+    ASSERT_EQ(classify(4, permanent_managed), CBM_DAEMON_PROCESS_INVALID);
+
+    char public_key[CBM_DAEMON_KEY_SIZE];
+    char managed_key[CBM_DAEMON_KEY_SIZE];
+    ASSERT(cbm_daemon_rendezvous_key_for_product(false, public_key));
+    ASSERT(cbm_daemon_rendezvous_key_for_product(true, managed_key));
+    ASSERT_STR_NEQ(public_key, managed_key);
+
+    cbm_daemon_bootstrap_launch_spec_t spec = {0};
+    ASSERT(cbm_daemon_bootstrap_launch_spec_init_vulcan_managed("codebase-memory-mcp", &spec));
+    ASSERT_EQ(spec.argc, 3);
+    ASSERT_STR_EQ(spec.argv[1], CBM_DAEMON_INTERNAL_ARG);
+    ASSERT_STR_EQ(spec.argv[2], CBM_DAEMON_VULCAN_MANAGED_ARG);
+    ASSERT_NULL(spec.argv[3]);
+    ASSERT(spec.detached);
+    ASSERT(!spec.inherit_standard_handles);
+    ASSERT(!spec.use_shell);
     PASS();
 }
 
@@ -767,6 +815,7 @@ TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous) {
 
 SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients);
+    RUN_TEST(daemon_bootstrap_vulcan_product_identity_is_explicit_and_separate);
     RUN_TEST(daemon_bootstrap_classifies_stateless_commands_without_client);
     RUN_TEST(daemon_bootstrap_classifies_config_as_coordinated_local_cli);
     RUN_TEST(daemon_bootstrap_cli_help_is_stateless_but_tool_calls_are_local);

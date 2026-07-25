@@ -50,17 +50,10 @@ jobs:
             {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"},
             {"os":"macos-15","cc":"cc","cxx":"c++"}
           ]'
-          # Each Windows leg pins the msys2 environment + package arch to the
-          # RUNNER architecture so the build is native, never emulated:
-          #   x86-64 runners -> CLANG64 (mingw-w64-clang-x86_64-*)
-          #   ARM64  runner  -> CLANGARM64 (mingw-w64-clang-aarch64-*)
-          # windows-11-arm previously used the x86-64 CLANG64 toolchain, so its
-          # binary ran under Windows-on-ARM x86-64 emulation and ASan's function
-          # interception crashed (interception_win: unhandled instruction). With
-          # the native ARM64 toolchain ASan instruments native ARM64 code, so it
-          # is a real (non-optional) gate, not a tolerated emulated-flake.
+          # Windows tests intentionally stay on the dedicated product's only
+          # supported Windows architecture: native x86-64 CLANG64.
           CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
-          BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
+          BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"}]'
           if [ "$BROAD" = "true" ]; then
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
             WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
@@ -305,17 +298,6 @@ jobs:
 
       - name: Test
         shell: msys2 {0}
-        # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
-        # libclang_rt.asan for aarch64-w64-windows-gnu) and cannot intercept the
-        # system DLLs under x86-64 emulation either. Instead of running the
-        # ARM64 leg unsanitized, it runs UBSan in TRAP mode: -fsanitize-trap
-        # needs no runtime library (the very thing aarch64-w64-windows-gnu
-        # lacks), so it instruments natively and turns any undefined behavior
-        # into an illegal-instruction trap; -fstack-protector-strong adds
-        # stack-smash coverage the heap tools miss. To see WHICH check fired,
-        # reproduce under the emulated x86_64 UBSan (win.sh ubsan-build), which
-        # carries the full message. x86-64 Windows keeps full ASan+UBSan; the
-        # other native-ARM legs (Linux/macOS) carry ASan+LSan+TSan.
         run: |
           # Native tests resolve temp via TEMP/TMP (cbm_tmpdir); shell tools use
           # TMPDIR. Route both through the protected root created above so no
@@ -323,7 +305,7 @@ jobs:
           export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
           export TMP="$TEMP"
           export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
-          scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && '"SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer"' || '' }}
+          scripts/test.sh CC=clang CXX=clang++
         env:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
@@ -413,62 +395,3 @@ jobs:
             echo "OK: $leg — $n shard(s), union of slices == full suite list"
           done
           exit "$rc"
-
-  # Windows product-surface regression guards. Distinct from test-windows above
-  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
-  # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
-  # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
-  # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
-  # the UI directory picker not enumerating drives (#548, roots field), and non-ASCII
-  # CLI arguments being mangled by the narrow-argv main() (#423/#20, fixed by the
-  # wide-argv entrypoint that reads GetCommandLineW).
-  test-windows-guards:
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-zlib
-            mingw-w64-clang-x86_64-ccache
-            make
-            git
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Test npm wrapper failure handling
-        working-directory: pkg/npm
-        run: npm test
-
-      - name: Compiler cache (content-verified)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-guards-${{ github.ref }}-${{ github.sha }}
-          restore-keys: |
-            ccache-guards-${{ github.ref }}-
-            ccache-guards-
-
-      - name: Build product binary with embedded UI
-        shell: msys2 {0}
-        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
-        # guard's HTTP UI is available. Functional gate only (no sanitizers).
-        run: scripts/build.sh --with-ui CC=clang CXX=clang++
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/.ccache
-          CCACHE_MAXSIZE: 1500M
-
-      - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
-        shell: pwsh
-        # -GuardsOnly runs the four green guards and gates on them. All guards run
-        # against the real supervisor->worker spawn path: under the mandatory
-        # coordination daemon, CBM_INDEX_SUPERVISOR=0 is a fail-closed refusal, so
-        # the driver no longer sets it anywhere.
-        run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

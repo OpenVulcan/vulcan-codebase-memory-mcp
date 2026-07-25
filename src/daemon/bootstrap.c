@@ -7,6 +7,7 @@
 #include "daemon/service.h"
 #include "foundation/compat.h"
 #include "foundation/platform.h"
+#include "mcp/index_supervisor.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -129,6 +130,9 @@ static bool bootstrap_worker_argv_exact(int argc, char *const argv[]) {
         }
         next += 2;
     }
+    if (next < argc && bootstrap_arg_is(argv[next], CBM_INDEX_WORKER_VULCAN_MANAGED_ARG)) {
+        next++;
+    }
     return next == argc;
 }
 
@@ -140,13 +144,17 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
     int daemon_arg = bootstrap_find_arg(argc, argv, CBM_DAEMON_INTERNAL_ARG);
     if (daemon_arg >= 0) {
         /* Byte-exact daemon-role grammar, deliberately unforgiving: the bare
-         * internal marker, or the marker followed by exactly the permanent
-         * flag. Every other shape — reordered, repeated, or extended — is
-         * INVALID, so argv smuggling cannot reach the daemon role. */
+         * internal marker, or the marker followed by exactly one lifecycle or
+         * product flag. Every other shape — reordered, repeated, combined, or
+         * extended — is INVALID, so argv smuggling cannot reach the daemon role. */
         if (argc == 2 && daemon_arg == 1) {
             return CBM_DAEMON_PROCESS_DAEMON;
         }
         if (argc == 3 && daemon_arg == 1 && bootstrap_arg_is(argv[2], CBM_DAEMON_PERMANENT_ARG)) {
+            return CBM_DAEMON_PROCESS_DAEMON;
+        }
+        if (argc == 3 && daemon_arg == 1 &&
+            bootstrap_arg_is(argv[2], CBM_DAEMON_VULCAN_MANAGED_ARG)) {
             return CBM_DAEMON_PROCESS_DAEMON;
         }
         return CBM_DAEMON_PROCESS_INVALID;
@@ -205,8 +213,13 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role) {
 }
 
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent) {
+    return cbm_daemon_bootstrap_endpoint_new_for_product(runtime_parent, false);
+}
+
+cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new_for_product(const char *runtime_parent,
+                                                                         bool vulcan_managed) {
     char key[CBM_DAEMON_KEY_SIZE];
-    if (!cbm_daemon_rendezvous_key(key)) {
+    if (!cbm_daemon_rendezvous_key_for_product(vulcan_managed, key)) {
         return NULL;
     }
     return cbm_daemon_ipc_endpoint_new(key, runtime_parent);
@@ -234,6 +247,16 @@ bool cbm_daemon_bootstrap_launch_spec_init_permanent(const char *executable_path
         return false;
     }
     spec_out->argv[2] = CBM_DAEMON_PERMANENT_ARG;
+    spec_out->argc = 3U;
+    return true;
+}
+
+bool cbm_daemon_bootstrap_launch_spec_init_vulcan_managed(
+    const char *executable_path, cbm_daemon_bootstrap_launch_spec_t *spec_out) {
+    if (!cbm_daemon_bootstrap_launch_spec_init(executable_path, spec_out)) {
+        return false;
+    }
+    spec_out->argv[2] = CBM_DAEMON_VULCAN_MANAGED_ARG;
     spec_out->argc = 3U;
     return true;
 }
@@ -465,7 +488,9 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
 
         cbm_daemon_bootstrap_launch_spec_t spec;
         bool spec_ready =
-            config->spawn_permanent
+            config->vulcan_managed ? cbm_daemon_bootstrap_launch_spec_init_vulcan_managed(
+                                         config->executable_path, &spec)
+            : config->spawn_permanent
                 ? cbm_daemon_bootstrap_launch_spec_init_permanent(config->executable_path, &spec)
                 : cbm_daemon_bootstrap_launch_spec_init(config->executable_path, &spec);
         if (!spec_ready || !ops->startup_lock_prepare_handoff(ops->context, startup_lock) ||
@@ -750,11 +775,11 @@ static bool bootstrap_production_spawn(void *context,
     ZeroMemory(&child, sizeof(child));
     startup.cb = sizeof(startup);
     DWORD flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
-    /* A managed frontend payload is intentionally contained in the permanent
-     * launcher's kill-on-close job. The account daemon outlives that one
-     * frontend and therefore uses breakaway when the containing job explicitly
-     * permits it. Do not request breakaway from an unrelated restrictive job:
-     * CreateProcess would fail and regress portable/package-manager payloads. */
+    /* A packaged frontend may itself run in a kill-on-close job. Permit the
+     * daemon to break away only when that containing job explicitly allows it;
+     * application-scoped managed lifetime is then governed by the authenticated
+     * frontend session. Do not request breakaway from an unrelated restrictive
+     * job: CreateProcess would fail and regress portable/package-manager payloads. */
     BOOL in_job = FALSE;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits;
     memset(&job_limits, 0, sizeof(job_limits));

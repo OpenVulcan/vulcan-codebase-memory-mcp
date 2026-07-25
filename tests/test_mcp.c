@@ -12,6 +12,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <daemon/managed_project_registry.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h>
@@ -33,6 +34,7 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+
 #include <spawn.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -41,6 +43,84 @@
 #define cbm_getcwd getcwd
 extern char **environ;
 #endif
+
+/*
+ * Managed-operation observation state for protocol-focused tests.
+ *
+ * 协议测试使用的托管操作观测状态。
+ */
+typedef struct {
+    cbm_managed_project_registry_t *registry;
+    size_t watch_calls;
+    size_t unwatch_calls;
+    size_t schedule_calls;
+    size_t cancel_calls;
+    bool reject_watch;
+    bool reject_schedule;
+} mcp_managed_test_context_t;
+
+/*
+ * Apply and count a managed watcher transition for protocol-focused tests.
+ *
+ * 在协议测试中应用并统计托管 watcher 转换。
+ */
+static bool mcp_managed_test_watch(void *context, const char *project_key,
+                                   const char *canonical_root) {
+    mcp_managed_test_context_t *state = context;
+    if (!state || !state->registry || !project_key || !project_key[0] || !canonical_root ||
+        !canonical_root[0] || state->reject_watch) {
+        return false;
+    }
+    state->watch_calls++;
+    return cbm_managed_project_registry_set_watcher(state->registry, project_key, true);
+}
+
+/*
+ * Apply and count a managed watcher removal in the protocol fixture.
+ *
+ * 在协议夹具中应用并统计托管 watcher 移除。
+ */
+static void mcp_managed_test_unwatch(void *context, const char *project_key) {
+    mcp_managed_test_context_t *state = context;
+    if (state && state->registry && project_key) {
+        state->unwatch_calls++;
+        (void)cbm_managed_project_registry_set_watcher(state->registry, project_key, false);
+    }
+}
+
+/*
+ * Apply and count a managed index admission in the protocol fixture.
+ *
+ * 在协议夹具中应用并统计托管索引准入。
+ */
+static cbm_mcp_managed_index_status_t mcp_managed_test_schedule(void *context,
+                                                                const char *project_key,
+                                                                const char *canonical_root,
+                                                                bool force) {
+    (void)force;
+    mcp_managed_test_context_t *state = context;
+    if (!state || !state->registry || !project_key || !project_key[0] || !canonical_root ||
+        !canonical_root[0] || state->reject_schedule) {
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
+    state->schedule_calls++;
+    return cbm_managed_project_registry_mark_indexing(state->registry, project_key)
+               ? CBM_MCP_MANAGED_INDEX_RUNNING
+               : CBM_MCP_MANAGED_INDEX_FAILED;
+}
+
+/*
+ * Count managed index cancellation in the protocol fixture.
+ *
+ * 在协议夹具中统计托管索引取消。
+
+ */
+static void mcp_managed_test_cancel(void *context, const char *project_key) {
+    mcp_managed_test_context_t *state = context;
+    if (state && project_key) {
+        state->cancel_calls++;
+    }
+}
 
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
     yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
@@ -3530,14 +3610,8 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
-/* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
- * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
- * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
- * space splits one path into several bogus args -> grep finds nothing ->
- * total_grep_matches == 0 (RED on the unfixed code). The fix writes NUL-separated
- * records + uses `xargs -0`, so the path stays a single argument -> match found
- * (GREEN). On Windows the scoped path uses PowerShell Get-Content -LiteralPath,
- * which already handles spaces, so this asserts correct behavior there too. */
+/* Regression guard (#687): an indexed project root containing a space must be
+ * scanned as one native path and still produce text matches. */
 TEST(search_code_scoped_path_with_spaces_issue687) {
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_space_XXXXXX");
@@ -3569,8 +3643,8 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     cbm_mcp_server_set_project(srv, proj);
     cbm_store_upsert_project(st, proj, proj_dir);
 
-    /* A node so the file is "indexed" (cbm_store_list_files -> scoped grep path)
-     * and the grep hit classifies to a result. */
+    /* A node makes the file part of the indexed scan set and lets the text hit
+     * classify to a graph result. */
     cbm_node_t n = {.project = proj,
                     .label = "Function",
                     .name = "HandleRequest",
@@ -3588,7 +3662,7 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
 
-    /* grep must have found the match despite the space in the root path. */
+    /* The in-process scan must find the match despite the spaced root path. */
     int grep_matches = -1;
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
@@ -3609,11 +3683,8 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
 }
 
 #ifdef _WIN32
-/* Issue #903 follow-up: scoped search_code on Windows writes a UTF-8 filelist
- * containing absolute source paths, then reads it back through PowerShell.
- * Windows PowerShell 5.1 treats UTF-8 without BOM as ANSI unless told
- * otherwise, so a non-ASCII project root can be mojibaked before
- * Select-String sees the LiteralPath. */
+/* Issue #903 follow-up: the in-process Windows scan must preserve a UTF-8
+ * project root without any command-shell encoding round trip. */
 TEST(search_code_scoped_path_with_cjk_root_issue903) {
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s/cbm_srch_cjk_XXXXXX", cbm_tmpdir());
@@ -9275,6 +9346,338 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+/*
+ * Verify schema projection, controller sync, and hidden-context authorization.
+ *
+ * 验证参数结构投影、控制器同步和隐藏上下文授权。
+ */
+TEST(vulcan_managed_profile_authorizes_hidden_context) {
+    char cwd[CBM_SZ_4K];
+    ASSERT(cbm_getcwd(cwd, sizeof(cwd)) != NULL);
+    char canonical[CBM_SZ_4K];
+    ASSERT(cbm_canonical_path(cwd, canonical, sizeof(canonical)));
+    cbm_normalize_path_sep(canonical);
+
+    cbm_managed_project_registry_t *registry = cbm_managed_project_registry_new();
+    ASSERT(registry != NULL);
+    mcp_managed_test_context_t managed_context = {.registry = registry};
+    static const cbm_mcp_managed_ops_t operations = {
+        .watch_project = mcp_managed_test_watch,
+        .unwatch_project = mcp_managed_test_unwatch,
+        .schedule_index = mcp_managed_test_schedule,
+        .cancel_index = mcp_managed_test_cancel,
+    };
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT(server != NULL);
+    cbm_mcp_server_set_tool_profile(server, CBM_MCP_TOOL_PROFILE_VULCAN);
+    cbm_mcp_server_set_vulcan_managed(server, registry, &operations, &managed_context);
+
+    char *public_tools = cbm_mcp_tools_list();
+    ASSERT(public_tools != NULL);
+    ASSERT(strstr(public_tools, "\"name\":\"vulcan_sync_projects\"") == NULL);
+    free(public_tools);
+
+    char *result = cbm_mcp_handle_tool(server, "get_graph_schema", "{}");
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "invalid_vulcan_context") != NULL);
+    ASSERT(strstr(result, "\"isError\":true") != NULL);
+    free(result);
+
+    char sync_args[CBM_SZ_8K];
+    ASSERT(snprintf(sync_args, sizeof(sync_args),
+                    "{\"contract\":\"%s\",\"generation\":1,\"projects\":[{"
+                    "\"project_id\":\"project-1\",\"pwd\":\"%s\"}]}",
+                    CBM_VULCAN_MANAGED_CONTRACT, canonical) < (int)sizeof(sync_args));
+    result = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync_args);
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "\"isError\":true") == NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"status\\\":\\\"committed\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"accepted\\\":true") != NULL);
+    ASSERT(strstr(result, "\\\"index_status\\\":") != NULL);
+    free(result);
+
+    char control_args[CBM_SZ_8K];
+    ASSERT(snprintf(control_args, sizeof(control_args),
+                    "{\"contract\":\"%s\",\"project_id\":\"project-1\",\"pwd\":\"%s\"}",
+                    CBM_VULCAN_MANAGED_CONTRACT, canonical) < (int)sizeof(control_args));
+    result = cbm_mcp_handle_tool(server, "vulcan_project_status", control_args);
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "\"isError\":true") == NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"project_id\\\":\\\"project-1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"index_status\\\":") != NULL);
+    free(result);
+
+    result = cbm_mcp_handle_tool(server, "vulcan_reindex_project", control_args);
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "\"isError\":true") == NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"project_id\\\":\\\"project-1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"accepted\\\":true") != NULL);
+    ASSERT(strstr(result, "\\\"coalesced\\\":true") != NULL);
+    free(result);
+
+    char context_args[CBM_SZ_8K];
+    ASSERT(snprintf(context_args, sizeof(context_args),
+                    "{\"_vulcan\":{\"contract\":\"%s\","
+                    "\"project_id\":\"project-1\",\"pwd\":\"%s\","
+                    "\"session_id\":\"session-secret\"}}",
+                    CBM_VULCAN_MANAGED_CONTRACT, canonical) < (int)sizeof(context_args));
+    result = cbm_mcp_handle_tool(server, "get_graph_schema", context_args);
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "invalid_vulcan_context") == NULL);
+    ASSERT(strstr(result, "project_not_authorized") == NULL);
+    ASSERT(strstr(result, "model_project_override") == NULL);
+    free(result);
+
+    char duplicate_context_args[CBM_SZ_16K];
+    ASSERT(snprintf(duplicate_context_args, sizeof(duplicate_context_args),
+                    "{\"_vulcan\":{\"contract\":\"%s\","
+                    "\"project_id\":\"project-1\",\"pwd\":\"%s\","
+                    "\"session_id\":\"session-secret\"},"
+                    "\"_vulcan\":{\"contract\":\"%s\","
+                    "\"project_id\":\"project-1\",\"pwd\":\"%s\","
+                    "\"session_id\":\"session-secret\"}}",
+                    CBM_VULCAN_MANAGED_CONTRACT, canonical, CBM_VULCAN_MANAGED_CONTRACT,
+                    canonical) < (int)sizeof(duplicate_context_args));
+    result = cbm_mcp_handle_tool(server, "get_graph_schema", duplicate_context_args);
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "invalid_vulcan_context") != NULL);
+    ASSERT(strstr(result, "\"isError\":true") != NULL);
+    free(result);
+
+    result = cbm_mcp_handle_tool(server, "get_graph_schema",
+                                 "{\"project\":\"forged\",\"_vulcan\":{\"contract\":"
+                                 "\"vulcan.codebase-memory/1\",\"project_id\":\"project-1\","
+                                 "\"pwd\":\"C:/forged\",\"session_id\":\"session-secret\"}}");
+    ASSERT(result != NULL);
+    ASSERT(strstr(result, "model_project_override") != NULL);
+    ASSERT(strstr(result, "\"isError\":true") != NULL);
+    free(result);
+
+    char *tools = cbm_mcp_server_handle(
+        server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT(tools != NULL);
+    yyjson_doc *tools_doc = yyjson_read(tools, strlen(tools), 0);
+    ASSERT(tools_doc != NULL);
+    yyjson_val *response_root = yyjson_doc_get_root(tools_doc);
+    yyjson_val *result_root = yyjson_obj_get(response_root, "result");
+    yyjson_val *tool_array = result_root ? yyjson_obj_get(result_root, "tools") : NULL;
+    ASSERT(tool_array && yyjson_is_arr(tool_array));
+    bool found_search = false;
+    size_t index = 0U;
+    size_t maximum = 0U;
+    yyjson_val *tool = NULL;
+    yyjson_arr_foreach(tool_array, index, maximum, tool) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), "search_graph") != 0) {
+            continue;
+        }
+        found_search = true;
+        yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+        yyjson_val *properties = schema ? yyjson_obj_get(schema, "properties") : NULL;
+        ASSERT(properties && yyjson_is_obj(properties));
+        ASSERT(yyjson_obj_get(properties, "project") == NULL);
+    }
+    ASSERT(found_search);
+    yyjson_doc_free(tools_doc);
+    free(tools);
+
+    char *initialize =
+        cbm_mcp_server_handle(server, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\","
+                                      "\"params\":{\"protocolVersion\":\"2025-03-26\"}}");
+    ASSERT(initialize != NULL);
+    ASSERT(strstr(initialize, "vulcan-codebase-memory-mcp") != NULL);
+    ASSERT(strstr(initialize, CBM_VULCAN_MANAGED_CONTRACT) != NULL);
+    free(initialize);
+
+    cbm_mcp_server_free(server);
+    cbm_managed_project_registry_free(registry);
+    PASS();
+}
+
+/*
+ * Verify one managed connection routes three projects, reconciles removals,
+ * rejects
+ * stale/invalid generations atomically, and retains database files.
+ *
+ * 验证单个托管连接路由三个项目、对账移除、原子拒绝过期或非法 generation，
+
+ * * 并保留数据库文件。
+
+ */
+TEST(vulcan_managed_multi_project_reconciliation_is_authoritative) {
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char cache[CBM_SZ_4K];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-vulcan-managed-cache-XXXXXX", cbm_tmpdir());
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    bool environment_ready = cache_ready && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    /* Canonical roots, derived storage keys, and published databases.
+     *
+     * 规范化根路径、派生存储键和已发布数据库。 */
+    char roots[3][CBM_SZ_4K] = {{0}};
+    char canonical[3][CBM_SZ_4K] = {{0}};
+    char database_paths[3][CBM_SZ_4K] = {{0}};
+    char *keys[3] = {0};
+    bool projects_ready = environment_ready;
+    for (size_t index = 0U; index < 3U && projects_ready; index++) {
+        (void)snprintf(roots[index], sizeof(roots[index]), "%s/cbm-vulcan-project-%zu-XXXXXX",
+                       cbm_tmpdir(), index + 1U);
+        projects_ready =
+            cbm_mkdtemp(roots[index]) != NULL &&
+            cbm_canonical_path(roots[index], canonical[index], sizeof(canonical[index]));
+        if (!projects_ready) {
+            break;
+        }
+        cbm_normalize_path_sep(canonical[index]);
+        keys[index] = cbm_project_name_from_path(canonical[index]);
+        projects_ready = keys[index] != NULL &&
+                         snprintf(database_paths[index], sizeof(database_paths[index]), "%s/%s.db",
+                                  cache, keys[index]) < (int)sizeof(database_paths[index]);
+        cbm_store_t *seed = projects_ready ? cbm_store_open_path(database_paths[index]) : NULL;
+        projects_ready =
+            seed && cbm_store_upsert_project(seed, keys[index], canonical[index]) == CBM_STORE_OK;
+        cbm_store_close(seed);
+    }
+
+    cbm_managed_project_registry_t *registry =
+        projects_ready ? cbm_managed_project_registry_new() : NULL;
+    mcp_managed_test_context_t managed_context = {.registry = registry};
+    static const cbm_mcp_managed_ops_t operations = {
+        .watch_project = mcp_managed_test_watch,
+        .unwatch_project = mcp_managed_test_unwatch,
+        .schedule_index = mcp_managed_test_schedule,
+        .cancel_index = mcp_managed_test_cancel,
+    };
+    cbm_mcp_server_t *server = registry ? cbm_mcp_server_new(NULL) : NULL;
+    if (server) {
+        cbm_mcp_server_set_tool_profile(server, CBM_MCP_TOOL_PROFILE_VULCAN);
+        cbm_mcp_server_set_vulcan_managed(server, registry, &operations, &managed_context);
+    }
+
+    char sync[32768];
+    bool sync_encoded = server && snprintf(sync, sizeof(sync),
+                                           "{\"contract\":\"%s\",\"generation\":1,\"projects\":["
+                                           "{\"project_id\":\"project-1\",\"pwd\":\"%s\"},"
+                                           "{\"project_id\":\"project-2\",\"pwd\":\"%s\"},"
+                                           "{\"project_id\":\"project-3\",\"pwd\":\"%s\"}]}",
+                                           CBM_VULCAN_MANAGED_CONTRACT, canonical[0], canonical[1],
+                                           canonical[2]) < (int)sizeof(sync);
+    char *response =
+        sync_encoded ? cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync) : NULL;
+    bool three_committed = response && strstr(response, "\\\"project_count\\\":3") &&
+                           strstr(response, "\\\"added\\\":3") &&
+                           strstr(response, "\\\"failed\\\":0");
+    free(response);
+    response = NULL;
+
+    bool routed_all = three_committed;
+    for (size_t index = 0U; index < 3U && routed_all; index++) {
+        char arguments[CBM_SZ_8K];
+        (void)snprintf(arguments, sizeof(arguments),
+                       "{\"_vulcan\":{\"contract\":\"%s\","
+                       "\"project_id\":\"project-%zu\",\"pwd\":\"%s\","
+                       "\"session_id\":\"multi-session\"}}",
+                       CBM_VULCAN_MANAGED_CONTRACT, index + 1U, canonical[index]);
+        response = cbm_mcp_handle_tool(server, "get_graph_schema", arguments);
+        routed_all = response && strstr(response, "\"isError\":true") == NULL &&
+                     strstr(response, "project_not_authorized") == NULL;
+        free(response);
+        response = NULL;
+    }
+
+    response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
+    bool stale_rejected = response && strstr(response, "stale_generation");
+    free(response);
+    response = NULL;
+
+    (void)snprintf(sync, sizeof(sync),
+                   "{\"contract\":\"%s\",\"generation\":2,\"projects\":["
+                   "{\"project_id\":\"project-1\",\"pwd\":\"%s\"},"
+                   "{\"project_id\":\"project-3\",\"pwd\":\"%s\"}]}",
+                   CBM_VULCAN_MANAGED_CONTRACT, canonical[0], canonical[2]);
+    response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
+    bool removal_committed = response && strstr(response, "\\\"project_count\\\":2") &&
+                             strstr(response, "\\\"retained\\\":2") &&
+                             strstr(response, "\\\"removed\\\":1");
+    free(response);
+    response = NULL;
+    bool removed_database_retained = cbm_file_size(database_paths[1]) >= 0;
+
+    (void)snprintf(sync, sizeof(sync), "{\"contract\":\"%s\",\"generation\":3,\"projects\":[]}",
+                   CBM_VULCAN_MANAGED_CONTRACT);
+    response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
+    bool empty_committed = response && strstr(response, "\\\"project_count\\\":0") &&
+                           strstr(response, "\\\"removed\\\":2");
+    free(response);
+    response = NULL;
+
+    /* Force the no-database admission path and verify operational failures
+     * are explicit
+     * without rolling back the authoritative registry commit.
+     *
+     * 强制进入无数据库准入路径，验证操作失败被明确报告，同时不回滚权威注册表提交。 */
+    bool first_database_removed = cbm_unlink(database_paths[0]) == 0;
+    managed_context.reject_schedule = true;
+    (void)snprintf(sync, sizeof(sync),
+                   "{\"contract\":\"%s\",\"generation\":4,\"projects\":["
+                   "{\"project_id\":\"project-1\",\"pwd\":\"%s\"}]}",
+                   CBM_VULCAN_MANAGED_CONTRACT, canonical[0]);
+    response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
+    bool scheduling_failure_reported = response && strstr(response, "\\\"failed\\\":1") &&
+                                       strstr(response, "\\\"lifecycle\\\":\\\"failed\\\"");
+    free(response);
+    response = NULL;
+
+    (void)snprintf(sync, sizeof(sync),
+                   "{\"contract\":\"%s\",\"generation\":5,\"projects\":["
+                   "{\"project_id\":\"duplicate\",\"pwd\":\"%s\"},"
+                   "{\"project_id\":\"duplicate\",\"pwd\":\"%s\"}]}",
+                   CBM_VULCAN_MANAGED_CONTRACT, canonical[0], canonical[2]);
+    response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
+    bool invalid_atomic = response && strstr(response, "project_conflict") &&
+                          cbm_managed_project_registry_generation(registry) == 4U &&
+                          cbm_managed_project_registry_count(registry) == 1U;
+    free(response);
+
+    cbm_mcp_server_free(server);
+    cbm_managed_project_registry_free(registry);
+    for (size_t index = 0U; index < 3U; index++) {
+        (void)cbm_unlink(database_paths[index]);
+        if (roots[index][0]) {
+            (void)cbm_rmdir(roots[index]);
+        }
+        free(keys[index]);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    if (cache_ready) {
+        (void)th_rmtree(cache);
+    }
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(projects_ready);
+    ASSERT_TRUE(sync_encoded);
+    ASSERT_TRUE(three_committed);
+    ASSERT_EQ(managed_context.watch_calls, 5);
+    ASSERT_TRUE(routed_all);
+    ASSERT_TRUE(stale_rejected);
+    ASSERT_TRUE(removal_committed);
+    ASSERT_TRUE(removed_database_retained);
+    ASSERT_TRUE(empty_committed);
+    ASSERT_EQ(managed_context.unwatch_calls, 3);
+    ASSERT_EQ(managed_context.cancel_calls, 3);
+    ASSERT_TRUE(first_database_removed);
+    ASSERT_TRUE(scheduling_failure_reported);
+    ASSERT_EQ(managed_context.schedule_calls, 0);
+    ASSERT_TRUE(invalid_atomic);
+    PASS();
+}
+
 SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
@@ -9307,6 +9710,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_tools_have_behavior_annotations);
+    RUN_TEST(vulcan_managed_profile_authorizes_hidden_context);
+    RUN_TEST(vulcan_managed_multi_project_reconciliation_is_authoritative);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);

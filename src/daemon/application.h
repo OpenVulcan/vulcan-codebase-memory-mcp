@@ -12,6 +12,7 @@
 
 #include "daemon/runtime.h"
 #include "daemon/project_lock.h"
+#include "daemon/managed_project_registry.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 
@@ -79,6 +80,10 @@ typedef struct {
      * process-local manager; the daemon job registry reserves index projects
      * in-process and must not hold the worker's OS lease. */
     cbm_project_lock_manager_t *project_locks;
+    /* Explicit Vulcan-managed daemon mode. False preserves upstream behavior.
+     * 显式 Vulcan
+     * 托管 daemon 模式；false 保持上游行为。 */
+    bool vulcan_managed;
 } cbm_daemon_application_config_t;
 
 typedef enum {
@@ -177,5 +182,15 @@ size_t cbm_daemon_application_job_subscribers(cbm_daemon_application_t *applicat
                                               const char *project_key);
 size_t cbm_daemon_application_physical_job_limit(cbm_daemon_application_t *application);
 size_t cbm_daemon_application_worker_memory_budget_bytes(cbm_daemon_application_t *application);
+
+/* Return the current Vulcan-managed project count for diagnostics and tests.
+ * 返回当前 Vulcan
+ * 托管项目数量，供诊断和测试使用。 */
+size_t cbm_daemon_application_managed_project_count(cbm_daemon_application_t *application);
+
+/* Return the committed Vulcan-managed generation for diagnostics and tests.
+ * 返回已提交的
+ * Vulcan 托管 generation，供诊断和测试使用。 */
+uint64_t cbm_daemon_application_managed_generation(cbm_daemon_application_t *application);
 
 #endif /* CBM_DAEMON_APPLICATION_H */

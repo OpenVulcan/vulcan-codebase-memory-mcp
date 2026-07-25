@@ -57,6 +57,13 @@ typedef struct {
  * directory / current-user ACL, never by caller-provided identity text. */
 bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]);
 
+/*
+ * Derive a stable product key for either the public or Vulcan-managed daemon.
+ * 为公开
+ * daemon 或 Vulcan 托管 daemon 派生稳定的产品键。
+ */
+bool cbm_daemon_rendezvous_key_for_product(bool vulcan_managed, char out[CBM_DAEMON_KEY_SIZE]);
+
 /* SHA-256 of the exact executable bytes, encoded as 64 lowercase hex
  * characters plus NUL. This is captured once at process startup. */
 bool cbm_daemon_build_fingerprint_file(const char *path,
