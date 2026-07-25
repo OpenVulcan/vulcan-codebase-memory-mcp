@@ -19,8 +19,9 @@
 #   * set -u (NOT -e): we want every invariant to run even if one fails.
 #   * NO `sleep` loops anywhere. All waits are bounded via `read -t` (a bash
 #     builtin timeout) against fifos / the server's stdout fd. On msys2 the
-#     `coreutils` + `mingw-w64-clang-x86_64-python3` packages (already installed
-#     by _smoke.yml) provide everything used here.
+#     `coreutils` + `mingw-w64-clang-x86_64-python3` packages installed by the
+#     PR workflow provide everything used here.
+#     PR 工作流安装的上述依赖包提供此处所需的全部工具。
 #   * MSYS2/Windows: POSIX temp paths are converted to native form with
 #     `cygpath -m` before being handed to the binary (mirrors smoke-test.sh).
 

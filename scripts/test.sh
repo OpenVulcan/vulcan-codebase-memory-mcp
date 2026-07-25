@@ -62,8 +62,9 @@ done
 print_env "test.sh"
 
 # Step 0: fast build/security harness regressions run before the compiler-heavy
-# suite. The Windows package surface is static here; native launcher behavior is
-# exercised by scripts/test-windows.ps1.
+# suite. Vulcan ships one managed executable; Windows packaging and runtime
+# behavior are validated by the asset build, PR smoke, and managed E2E.
+# 步骤 0：先运行快速构建与安全回归；Vulcan 的 Windows 单文件包由资产构建、PR 冒烟和托管 E2E 验证。
 echo "=== Step 0a: build directory safety contract ==="
 bash "$ROOT/tests/test_build_dir_safety.sh"
 
@@ -76,13 +77,10 @@ bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 echo "=== Step 0d: daemon soak recovery contract ==="
 bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
-echo "=== Step 0e: Windows launcher bundle contract ==="
-bash "$ROOT/tests/test_windows_bundle_contract.sh"
-
-echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
+echo "=== Step 0e: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0g: security fuzz harness self-test ==="
+echo "=== Step 0f: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
 # Verify compiler supports target arch
