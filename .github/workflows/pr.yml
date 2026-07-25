@@ -1,7 +1,6 @@
-# PR validation: security gates + lint + full test suite. Builds, smoke and
-# soak stay maintainer-driven via the dry-run workflow_dispatch. Branch
-# protection requires `dco` + `ci-ok` — a single stable summary context that
-# fails unless every PR stage succeeded.
+# PR validation: security gates, lint, full test suite, dedicated smoke checks,
+# and the complete five-platform Vulcan asset matrix.
+# PR 校验包含安全门禁、代码检查、完整测试、专版冒烟检查及五平台 Vulcan 资产矩阵。
 name: PR
 
 on:
@@ -39,6 +38,16 @@ jobs:
       # (ubuntu x3, windows x2; coverage re-proven every run by the
       # shard-completeness job). Dry runs and releases shard identically.
       shard_suites: true
+
+  # Build and package every dedicated release target before merge.
+  # 合并前构建并打包全部专版发布目标。
+  assets:
+    needs: [test]
+    if: ${{ !cancelled() && needs.test.result == 'success' }}
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: dev
+      attest: false
 
   # ── Which files changed? Gate the (heavier) build+smoke on product code so
   #    docs / CI / test-only PRs stay fast. ──
@@ -158,10 +167,11 @@ jobs:
           -Executable .\build\c\vulcan-codebase-memory-mcp.exe
 
   ci-ok:
-    # The one required context (besides dco) — fails unless every PR stage
-    # succeeded, so matrix renames can never silently deadlock merges. `skipped`
-    # is OK: pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
-    needs: [security, lint, test, changes, pr-smoke]
+    # The stable required context fails unless every PR stage succeeded, so
+    # matrix renames can never silently weaken the merge gate. `skipped` is OK:
+    # pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
+    # 稳定汇总门禁要求全部 PR 阶段成功；仅文档、CI 或测试变更允许跳过专版冒烟检查。
+    needs: [security, lint, test, assets, changes, pr-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

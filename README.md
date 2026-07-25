@@ -13,6 +13,16 @@
 [![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
 [![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
+[![OpenVulcan](https://img.shields.io/badge/maintained_by-OpenVulcan-red)](https://github.com/OpenVulcan)
+
+> [!IMPORTANT]
+> **OpenVulcan dedicated edition / OpenVulcan 专版**
+>
+> This fork is maintained by the [OpenVulcan organization](https://github.com/OpenVulcan) as a dedicated Vulcan Code integration. The original project, authorship, MIT license, and upstream project information are retained.
+>
+> 本分支由 [OpenVulcan 组织](https://github.com/OpenVulcan)维护，作为 Vulcan Code 集成专版。原始项目、作者归属、MIT 许可证及上游项目信息均完整保留。
+>
+> Original upstream / 原始上游：[DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp)
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
@@ -774,4 +784,12 @@ Scan links for every release are also included in the GitHub Release notes autom
 
 ## License
 
-MIT
+MIT License.
+
+The OpenVulcan dedicated edition retains the original DeusData copyright and
+license notice. Copyright for OpenVulcan's derivative modifications is held by
+[OpenVulcan](https://github.com/OpenVulcan). See [LICENSE](LICENSE) for the
+complete terms.
+
+OpenVulcan 专版完整保留 DeusData 的原始版权与许可声明；OpenVulcan 对其派生修改
+保留相应版权。完整条款请参阅 [LICENSE](LICENSE)。
