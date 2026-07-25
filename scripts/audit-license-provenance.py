@@ -5,6 +5,7 @@ Verdicts:
   IDENTICAL          byte-equal to the upstream default-branch license
   IDENTICAL@PINNED   byte-equal to the license at the manifest's pinned commit
   FIRST-PARTY-OK     byte-equal to the project root LICENSE
+  FIRST-PARTY-RETAINED same MIT terms with retained original copyright lines
   FIRST-PARTY-VAR    first-party but text differs from root LICENSE (inspect)
   DIFFERS            no byte-equal upstream candidate found (inspect)
   ERROR              upstream fetch failed
@@ -54,6 +55,7 @@ LIBS = {
 CANDIDATE_NAMES = ["LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING",
                    "COPYING.txt", "LICENSE-MIT", "UNLICENSE", "LICENCE",
                    "license", "License.txt", "NOTICE"]
+COPYRIGHT_LINE = re.compile(r"^\s*Copyright \(c\) .+$")
 
 
 def gh_api(path):
@@ -99,6 +101,46 @@ def local_license(dirpath):
             with open(p, encoding="utf-8", errors="replace") as fh:
                 return f, fh.read()
     return None, None
+
+
+def first_party_license_retained(candidate, root_license):
+    """Verify retained first-party MIT terms and original copyright ownership.
+    验证保留的第一方 MIT 条款及原始版权归属。
+
+    Args:
+        candidate: First-party grammar license text.
+        root_license: Current project root license text.
+    参数：
+        candidate：第一方 grammar 许可证文本。
+        root_license：当前项目根许可证文本。
+
+    Returns:
+        True when non-copyright terms match and every candidate copyright is
+        still present in the root license.
+        当非版权条款一致且候选许可证的全部版权行仍存在于根许可证时返回 True。
+    """
+    # Candidate lines normalized for line endings and trailing whitespace.
+    # 对候选许可证行进行换行符和行尾空白规范化。
+    candidate_lines = [line.rstrip() for line in candidate.strip().splitlines()]
+    # Root lines normalized with the same deterministic rule.
+    # 使用相同确定性规则规范化根许可证行。
+    root_lines = [line.rstrip() for line in root_license.strip().splitlines()]
+    # Original copyrights declared by the first-party grammar.
+    # 第一方 grammar 声明的原始版权。
+    candidate_copyrights = {line.strip() for line in candidate_lines
+                            if COPYRIGHT_LINE.match(line)}
+    # Copyrights retained by the current root license.
+    # 当前根许可证保留的版权。
+    root_copyrights = {line.strip() for line in root_lines
+                       if COPYRIGHT_LINE.match(line)}
+    # License terms excluding additive copyright ownership lines.
+    # 排除新增版权归属行后的许可证条款。
+    candidate_terms = [line for line in candidate_lines
+                       if not COPYRIGHT_LINE.match(line)]
+    root_terms = [line for line in root_lines if not COPYRIGHT_LINE.match(line)]
+    return (bool(candidate_copyrights) and
+            candidate_copyrights.issubset(root_copyrights) and
+            candidate_terms == root_terms)
 
 
 def parse_manifest():
@@ -179,6 +221,10 @@ def main():
             fname, ours = local_license(d)
             if ours == root_license:
                 results[key] = ("FIRST-PARTY-OK", "== project root LICENSE")
+            elif ours is not None and first_party_license_retained(ours, root_license):
+                results[key] = (
+                    "FIRST-PARTY-RETAINED",
+                    f"{fname}: original copyright retained; MIT terms match root LICENSE")
             else:
                 results[key] = ("FIRST-PARTY-VAR", f"{fname}: differs from root LICENSE")
             continue
@@ -214,6 +260,7 @@ def main():
     print("\nfull results: /tmp/audit_licenses_results.json")
 
     accepted = {"IDENTICAL", "IDENTICAL@PINNED", "FIRST-PARTY-OK",
+                "FIRST-PARTY-RETAINED",
                 "FIRST-PARTY-NOTICE", "MANUAL-VERIFIED"}
     bad = {k: v for k, v in results.items() if v[0] not in accepted}
     if bad:
