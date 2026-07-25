@@ -28,6 +28,10 @@ jobs:
 
   build:
     needs: [test]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_build.yml
     with:
       version: ${{ inputs.version }}
