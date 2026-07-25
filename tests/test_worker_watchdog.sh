@@ -85,6 +85,7 @@ set -euo pipefail
   --response-out "${TMPDIR_PATH}/resp" \
   --index-worker-single-thread \
   --index-worker-marker "${TMPDIR_PATH}/marker" \
+  --index-worker-vulcan-managed \
   >/dev/null 2>"${TMPDIR_PATH}/child.err" &
 echo "$!" >"${TMPDIR_PATH}/child.pid"
 wait
