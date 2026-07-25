@@ -8744,8 +8744,7 @@ static grep_match_t *collect_native_search_matches(cbm_mcp_server_t *srv, const 
             continue;
         }
         if (!scan_search_file(root_path, canonical_root, paths[i], pattern, use_regex,
-                              search_regex_ready ? &search_regex : NULL, match_limit, &matches,
-                              out_count, &match_capacity)) {
+                              &search_regex, match_limit, &matches, out_count, &match_capacity)) {
             scan_ok = false;
             break;
         }
@@ -9426,9 +9425,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int grep_limit = GREP_MAX_MATCHES;
     int gm_count = 0;
     bool scan_ok = false;
-    grep_match_t *gm = collect_native_search_matches(
-        srv, project, root_path, pattern, use_regex, file_pattern, has_path_filter,
-        has_path_filter ? &path_regex : NULL, grep_limit, &gm_count, &scan_ok);
+    grep_match_t *gm = collect_native_search_matches(srv, project, root_path, pattern, use_regex,
+                                                     file_pattern, has_path_filter, &path_regex,
+                                                     grep_limit, &gm_count, &scan_ok);
     if (!scan_ok) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
@@ -10944,7 +10943,7 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
     if (!committed) {
         const char *code = sync.status == CBM_MANAGED_SYNC_STALE_GENERATION ? "stale_generation"
                            : sync.status == CBM_MANAGED_SYNC_CONFLICT       ? "project_conflict"
-                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY ? "no_memory"
+                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY      ? "no_memory"
                                                                        : "invalid_sync_request";
         cbm_managed_sync_result_free(&sync);
         cbm_managed_project_registry_reconcile_end(srv->managed_projects);
