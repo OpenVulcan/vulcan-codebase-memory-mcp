@@ -55,6 +55,7 @@ CANONICAL = re.compile(
     r"|scripts/check-no-test-skips\.sh"
     r"|scripts/check-lsp-originality\.sh"
     r"|scripts/test-windows\.ps1"
+    r"|scripts/test-vulcan-managed-windows\.ps1"
     r"|pkg/glama/verify\.sh"
 )
 
@@ -76,9 +77,7 @@ FORBIDDEN = [
 
 # ── Layer 2: the whitelist walk over VENUE workflows ──
 VENUE_WORKFLOWS = [
-    "pr.yml", "dry-run.yml", "release.yml", "nightly-soak.yml",
-    "_test.yml", "_smoke.yml", "_soak.yml", "_build.yml", "_lint.yml",
-    "smoke.yml",
+    "pr.yml", "dry-run.yml", "release.yml", "_test.yml", "_build.yml", "_lint.yml",
 ]
 
 # Provisioning / plumbing commands a venue may run (first word of a line).
@@ -239,15 +238,11 @@ for wf in VENUE_WORKFLOWS:
 
 # ── Layer 3: the unification must stay referenced ──
 REQUIRED = [
-    ("_smoke.yml", r"vm-smoke\.sh", "the Windows smoke legs run the shared wrapper"),
-    ("_smoke.yml", r"scripts/smoke-local\.sh", "the unix smoke legs run the shared wrapper"),
-    ("_soak.yml", r"scripts/soak-legs\.sh", "the soak sequence lives in the canonical entry"),
-    ("_soak.yml", r"scripts/ci/new-protected-temp-root\.ps1", "Windows soak uses the shared temp root"),
     ("_test.yml", r"scripts/ci/new-protected-temp-root\.ps1", "Windows tests use the shared temp root"),
     ("_test.yml", r"scripts/test\.sh", "the test legs run the canonical entry"),
     ("pr.yml", r"vm-smoke\.sh", "PR CI smokes through the shared wrapper"),
-    ("_build.yml", r"scripts/package-release\.sh",
-     "release archives are produced by the canonical packaging entry"),
+    ("_build.yml", r"scripts/ci/package-vulcan-runtime\.sh",
+     "dedicated release archives are produced by the canonical Vulcan packaging entry"),
 ]
 for name, pattern, why in REQUIRED:
     path = workflows / name
@@ -260,7 +255,7 @@ for name, pattern, why in REQUIRED:
 # LOCAL VM leg enforces Defender-ON via the same canonical script in its
 # preflight (see LOCAL_REQUIRED below) — superset coverage where the platform
 # allows it.
-for name in ("_test.yml", "_soak.yml", "_smoke.yml", "pr.yml"):
+for name in ("_test.yml", "pr.yml"):
     path = workflows / name
     if path.exists() and "ensure-defender.ps1" in path.read_text():
         failures.append(

@@ -173,9 +173,9 @@ jobs:
       - name: Run dedicated Windows managed E2E
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: >
-          .\scripts\test-vulcan-managed-windows.ps1
-          -Executable .\build\c\vulcan-codebase-memory-mcp.exe
+        run: |
+          ./scripts/test-vulcan-managed-windows.ps1 `
+            -Executable ./build/c/vulcan-codebase-memory-mcp.exe
 
   ci-ok:
     # The stable required context fails unless every PR stage succeeded, so

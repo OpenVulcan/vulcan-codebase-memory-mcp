@@ -54,6 +54,40 @@ def cond(job):
         return ""
     return " ".join(m.group(2).split())
 
+# The dedicated Vulcan release has no optional test gate: every publish must traverse
+# lint -> test -> five-platform build -> publish, so validate that fixed chain directly.
+# Vulcan 专版发布没有可选测试门禁：每次发布都必须经过
+# lint -> test -> 五平台 build -> publish，因此直接验证这条固定链路。
+if "skip_tests:" not in text:
+    fixed_chain = {
+        "lint": None,
+        "test": "lint",
+        "build": "test",
+        "publish": "build",
+    }
+    for job, dependency in fixed_chain.items():
+        body = blocks.get(job)
+        if body is None:
+            failures.append(f"{job}: job missing from the dedicated release chain")
+            continue
+        if dependency is None:
+            continue
+        match = re.search(r"^    needs:\s*(.+)$", body, re.M)
+        needs = match.group(1) if match else ""
+        if dependency not in needs:
+            failures.append(
+                f"{job}: dedicated release job must depend on {dependency} (got: {needs or '<none>'})")
+    if failures:
+        for failure in failures:
+            print("FAIL: " + failure, file=sys.stderr)
+        print(
+            f"dedicated release gate-chain contract FAILED with {len(failures)} violation(s)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("PASS: dedicated release cannot bypass lint, test, or five-platform build")
+    sys.exit(0)
+
 # 1. Downstream-of-optional jobs must tolerate a deliberately skipped ancestor.
 #    `test` is the optional phase (if: !inputs.skip_tests); everything after it
 #    in the chain has to survive that.

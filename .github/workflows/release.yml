@@ -55,19 +55,7 @@ jobs:
           merge-multiple: true
 
       - name: Verify the exact dedicated release matrix
-        run: |
-          EXPECTED=(
-            vulcan-codebase-memory-mcp-linux-x86_64.tar.gz
-            vulcan-codebase-memory-mcp-linux-aarch64.tar.gz
-            vulcan-codebase-memory-mcp-macos-x86_64.tar.gz
-            vulcan-codebase-memory-mcp-macos-aarch64.tar.gz
-            vulcan-codebase-memory-mcp-windows-x86_64.zip
-          )
-          for artifact in "${EXPECTED[@]}"; do
-            test -s "$artifact"
-          done
-          test "$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 5
-          sha256sum "${EXPECTED[@]}" > checksums.txt
+        run: scripts/ci/verify-vulcan-release-matrix.sh
 
       - name: Replace an existing release
         if: ${{ inputs.replace }}

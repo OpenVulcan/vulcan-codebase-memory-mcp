@@ -202,21 +202,10 @@ jobs:
             ccache-tsan-${{ matrix.os }}-
 
       - name: ThreadSanitizer tests
-        # Calls make directly (no env.sh), so route the compilers through
-        # ccache's masquerade dir: /usr/lib/ccache on Debian, libexec under the
-        # Homebrew prefix on macOS. On Linux, reduce mmap ASLR entropy first:
-        # modern (esp. aarch64) kernels randomize high enough that TSan's
-        # shadow mapping aborts with "unexpected memory mapping" before any
-        # test runs. macOS TSan needs no such adjustment.
+        # The canonical test entry owns compiler setup and sanitizer behavior.
+        # 标准测试入口统一管理编译器配置和消毒器行为。
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export PATH="$(brew --prefix ccache)/libexec:$PATH"
-          else
-            export PATH=/usr/lib/ccache:$PATH
-            sudo sysctl -w vm.mmap_rnd_bits=28 || true
-          fi
-          export CCACHE_COMPILERCHECK=content
-          make -f Makefile.cbm test-tsan CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+          scripts/test.sh --tsan CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
@@ -251,41 +240,14 @@ jobs:
             git
 
       - name: Create protected per-user temp root
-        # The daemon suites fail closed on the MSYS-shared /tmp and on the
-        # runner's inherited LocalAppData\Temp ACLs. Give the whole harness a
-        # per-user root under the profile with an owner-stamped, protected
-        # current-SID DACL, matching the launcher/daemon trust policy.
+        # Use the shared ACL helper so every Windows venue enforces the same trust boundary.
+        # 使用共享 ACL 辅助脚本，确保所有 Windows 执行环境采用相同的信任边界。
         shell: pwsh
         run: |
-          $root = Join-Path $env:USERPROFILE ("cbm-ci-tmp-" + [guid]::NewGuid().ToString("N"))
-          New-Item -ItemType Directory -Path $root | Out-Null
-          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-          $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-          $acl.SetOwner($sid)
-          $acl.SetAccessRuleProtection($true, $false)
-          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $sid,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-              [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow)
-          $acl.AddAccessRule($rule) | Out-Null
-          Set-Acl -LiteralPath $root -AclObject $acl
+          $root = & scripts/ci/new-protected-temp-root.ps1 `
+            -Prefix 'cbm-ci-tmp-' `
+            -ProtectDir (Join-Path $env:GITHUB_WORKSPACE "build\c")
           "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # Pre-create the build directory with the same protected DACL so
-          # every build product inherits it. The workspace drive root grants
-          # Authenticated Users Modify by inheritance — a shape real user
-          # checkouts (under the profile) do not have — and the activation
-          # transaction's source-directory policy correctly refuses it, which
-          # would fail the install-flow tests on the environment, not the code.
-          $build = Join-Path $env:GITHUB_WORKSPACE "build\c"
-          New-Item -ItemType Directory -Path $build -Force | Out-Null
-          $bacl = [System.Security.AccessControl.DirectorySecurity]::new()
-          $bacl.SetOwner($sid)
-          $bacl.SetAccessRuleProtection($true, $false)
-          $bacl.AddAccessRule($rule) | Out-Null
-          Set-Acl -LiteralPath $build -AclObject $bacl
 
       - name: Compiler cache (content-verified)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

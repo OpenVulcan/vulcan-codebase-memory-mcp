@@ -59,6 +59,8 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
             make
+            zip
+            coreutils
 
       - name: Build dedicated Unix sidecar
         if: matrix.shell_kind == 'unix'
@@ -104,49 +106,24 @@ jobs:
       - name: Run Windows managed end-to-end test
         if: matrix.shell_kind == 'windows'
         shell: pwsh
-        run: >
-          .\scripts\test-vulcan-managed-windows.ps1
-          -Executable .\build\c\vulcan-codebase-memory-mcp.exe
+        run: |
+          ./scripts/test-vulcan-managed-windows.ps1 `
+            -Executable ./build/c/vulcan-codebase-memory-mcp.exe
 
       - name: Package dedicated Unix runtime
         if: matrix.shell_kind == 'unix'
         env:
           PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ inputs.version }}
-        run: |
-          VERSION="${VERSION#v}"
-          PACKAGE_DIR="package-${PLATFORM}"
-          mkdir "$PACKAGE_DIR"
-          cp build/c/vulcan-codebase-memory-mcp "$PACKAGE_DIR/"
-          SHA256=$(shasum -a 256 "$PACKAGE_DIR/vulcan-codebase-memory-mcp" | awk '{print $1}')
-          printf '{\n  "protocol": "vulcan.codebase-memory/1",\n  "version": "%s",\n  "platform": "%s",\n  "executable": "vulcan-codebase-memory-mcp",\n  "sha256": "%s"\n}\n' \
-            "$VERSION" "$PLATFORM" "$SHA256" > "$PACKAGE_DIR/manifest.json"
-          tar -czf "vulcan-codebase-memory-mcp-${PLATFORM}.tar.gz" -C "$PACKAGE_DIR" \
-            vulcan-codebase-memory-mcp manifest.json
+        run: scripts/ci/package-vulcan-runtime.sh "$PLATFORM" "$VERSION"
 
       - name: Package dedicated Windows runtime
         if: matrix.shell_kind == 'windows'
-        shell: pwsh
+        shell: msys2 {0}
         env:
           PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ inputs.version }}
-        run: |
-          $Version = $env:VERSION.TrimStart("v")
-          $PackageDirectory = Join-Path $PWD "package-$($env:PLATFORM)"
-          New-Item -ItemType Directory -Path $PackageDirectory | Out-Null
-          $DestinationBinary = Join-Path $PackageDirectory "vulcan-codebase-memory-mcp.exe"
-          Copy-Item .\build\c\vulcan-codebase-memory-mcp.exe $DestinationBinary
-          $Manifest = [ordered]@{
-              protocol = "vulcan.codebase-memory/1"
-              version = $Version
-              platform = $env:PLATFORM
-              executable = "vulcan-codebase-memory-mcp.exe"
-              sha256 = (Get-FileHash -Algorithm SHA256 $DestinationBinary).Hash.ToLowerInvariant()
-          }
-          $Manifest | ConvertTo-Json | Set-Content `
-              (Join-Path $PackageDirectory "manifest.json") -Encoding utf8NoBOM
-          Compress-Archive -Path "$PackageDirectory\*" `
-              -DestinationPath "vulcan-codebase-memory-mcp-$($env:PLATFORM).zip"
+        run: scripts/ci/package-vulcan-runtime.sh "$PLATFORM" "$VERSION"
 
       - name: Attest dedicated runtime
         if: ${{ inputs.attest }}
