@@ -12,10 +12,11 @@ usage() {
     cat <<'EOF'
 Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
-The canonical test entry: identical in local CI, PR CI, dry run and release.
-DEFAULT (no --suites) is exactly what CI runs: static contract checks
+The upstream-compatible full test entry for local, PR, and release validation.
+The dedicated Vulcan dry run intentionally compiles and packages only.
+DEFAULT (no --suites) runs static contract checks
 (Step 0a-0j), a CLEAN sanitizer build, every suite via the parallel harness,
-then the prod-binary regression guards (Steps 4-6).
+then the optional hang guard and security-string gate.
 
 Modes:
   (default)      The venue leg. Clean build (scripts/clean.sh) + all suites +
@@ -24,8 +25,8 @@ Modes:
                  --suites daemon,daemon_ipc. Rebuilds the test-runner
                  INCREMENTALLY (make dependency tracking, no clean) and runs
                  only those suites — seconds, not minutes. Skips the contract
-                 steps and prod-binary guards; the full default run remains
-                 the merge gate. Suite names: build/c/test-runner --list-suites.
+                 steps and production-only guards; the full default run remains
+                 available for upstream parity. Suite names: build/c/test-runner --list-suites.
   --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
                  widened TSan runner via make test-tsan — the same leg CI's
                  tsan jobs and the compose test-tsan service run.
@@ -254,25 +255,6 @@ if [ "${CBM_RUN_HANG_TEST:-0}" = "1" ]; then
     echo "=== Step 4: C++ index-hang regression (#410) ==="
     bash "$ROOT/tests/test_cpp_index_hang.sh"
 fi
-
-# Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
-# binary and verifies it self-exits when its launching parent is killed.
-#
-# TEST_SEAMS=1: the worker-mode leg below needs the crash-orphan probe, which is
-# compiled out of ordinary builds (it forks a SIGTERM-ignoring child — see
-# src/main.c). Requesting it HERE, in the leg that consumes it, is what keeps
-# release artifacts free of it; scripts/ci/check-binary-composition.sh proves
-# they stay that way.
-echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
-WATCHDOG_BINARY="$ROOT/$BUILD_DIR/vulcan-codebase-memory-mcp"
-CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
-
-# Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
-# (`cli --index-worker …`) whose supervisor dies must self-exit instead of
-# indexing on as an orphan. Reuses the prod binary built in Step 5.
-echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
-CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

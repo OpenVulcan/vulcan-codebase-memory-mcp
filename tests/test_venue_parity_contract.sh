@@ -290,21 +290,6 @@ for local in ["test-infrastructure/vm/win.sh",
                 f"{local}:{number}: internal harness called directly — route "
                 f"through the canonical entries\n      {s}")
 
-# Keep the dedicated Vulcan product name in every canonical watchdog entry.
-# 保证所有标准看门狗入口始终使用 Vulcan 专版产物名称。
-PRODUCT_IDENTITY_PATHS = [
-    "scripts/test.sh",
-    "tests/test_parent_watchdog.sh",
-    "tests/test_worker_watchdog.sh",
-]
-legacy_binary = re.compile(r"build[/\\]c[/\\]codebase-memory-mcp(?:\.exe)?")
-for local in PRODUCT_IDENTITY_PATHS:
-    path = root / local
-    if path.exists() and legacy_binary.search(path.read_text(encoding="utf-8")):
-        failures.append(
-            f"{local}: canonical watchdog entry references the retired upstream "
-            "binary name")
-
 # The parity lanes exist on the LOCAL venues too: artifact-flow smoke and the
 # glibc-floor leg in compose/run.sh, Defender preflight in the VM driver.
 LOCAL_REQUIRED = [

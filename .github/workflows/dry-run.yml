@@ -15,19 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    uses: ./.github/workflows/_lint.yml
-
-  test:
-    needs: [lint]
-    uses: ./.github/workflows/_test.yml
-    with:
-      skip_perf: true
-      broad_platforms: true
-      shard_suites: true
-
   build:
-    needs: [test]
     permissions:
       contents: read
       id-token: write

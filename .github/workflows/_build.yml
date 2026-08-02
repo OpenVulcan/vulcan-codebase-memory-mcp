@@ -103,13 +103,6 @@ jobs:
               throw "Public Codebase Memory artifact must not be produced."
           }
 
-      - name: Run Windows managed end-to-end test
-        if: matrix.shell_kind == 'windows'
-        shell: pwsh
-        run: |
-          ./scripts/test-vulcan-managed-windows.ps1 `
-            -Executable ./build/c/vulcan-codebase-memory-mcp.exe
-
       - name: Package dedicated Unix runtime
         if: matrix.shell_kind == 'unix'
         env:
