@@ -94,6 +94,10 @@ uint64_t cbm_now_ns(void);
 /* Monotonic millisecond timestamp. */
 uint64_t cbm_now_ms(void);
 
+/* Unix epoch timestamp in milliseconds for persisted or externally serialized timestamps.
+ * 用于持久化或对外序列化时间戳的 Unix 纪元毫秒数。 */
+uint64_t cbm_unix_epoch_ms(void);
+
 /* ── System info ───────────────────────────────────────────────── */
 
 /* Number of available CPU cores. */

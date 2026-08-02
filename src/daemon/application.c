@@ -391,7 +391,7 @@ static void application_managed_worker_log(const char *line, void *context) {
         job->application->managed_projects, job->project_key, job->managed_runtime_id,
         job->managed_job_id, application_managed_progress_phase(job->managed_progress.phase),
         job->managed_progress.completed_units, job->managed_progress.total_units,
-        job->managed_progress.has_total_units, job->managed_progress.unit, cbm_now_ms());
+        job->managed_progress.has_total_units, job->managed_progress.unit, cbm_unix_epoch_ms());
 }
 
 static cbm_index_worker_poll_t application_worker_poll_default(
@@ -1186,7 +1186,7 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
         application->managed_projects) {
         (void)cbm_managed_project_registry_mark_job_running(
             application->managed_projects, job->project_key, job->managed_runtime_id,
-            job->managed_job_id, cbm_now_ms());
+            job->managed_job_id, cbm_unix_epoch_ms());
     }
     if (cancel_now) {
         /* The worker thread owns this handle until destroy below. Invoke the
@@ -1569,7 +1569,7 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
             job->cancelled ? CBM_MANAGED_JOB_STATE_CANCELLED
                            : (job->successful ? CBM_MANAGED_JOB_STATE_SUCCEEDED
                                               : CBM_MANAGED_JOB_STATE_FAILED);
-        uint64_t completed_at_ms = cbm_now_ms();
+        uint64_t completed_at_ms = cbm_unix_epoch_ms();
         if (authoritative) {
             (void)cbm_managed_project_registry_update_job_progress(
                 application->managed_projects, job->project_key, job->managed_runtime_id,
@@ -2606,7 +2606,8 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(
      * 在任何工作线程启动前创建的精确注册表任务身份。 */
     cbm_managed_job_snapshot_t managed_job = {0};
     cbm_managed_job_begin_status_t begin_status = cbm_managed_project_registry_begin_job(
-        application->managed_projects, project_key, mode, trigger, cbm_now_ms(), &managed_job);
+        application->managed_projects, project_key, mode, trigger, cbm_unix_epoch_ms(),
+        &managed_job);
     if (begin_status == CBM_MANAGED_JOB_BEGIN_CONFLICT) {
         free(arguments);
         return CBM_MCP_MANAGED_INDEX_CONFLICT;
@@ -2699,7 +2700,8 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(
                         : "Managed index worker could not be admitted";
                 (void)cbm_managed_project_registry_publish_job(
                     application->managed_projects, project_key, managed_job.runtime_id,
-                    managed_job.job_id, terminal_state, cbm_now_ms(), error_code, error_message);
+                    managed_job.job_id, terminal_state, cbm_unix_epoch_ms(), error_code,
+                    error_message);
             }
             if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
                 return CBM_MCP_MANAGED_INDEX_CONFLICT;

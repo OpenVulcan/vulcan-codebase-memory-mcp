@@ -11,6 +11,7 @@
 #include "../src/foundation/system_info_internal.h"
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -188,6 +189,18 @@ TEST(platform_now_ns) {
 TEST(platform_now_ms) {
     uint64_t t1 = cbm_now_ms();
     ASSERT_GT(t1, 0);
+    PASS();
+}
+
+TEST(platform_unix_epoch_ms_tracks_wall_clock) {
+    time_t before_seconds = time(NULL);
+    uint64_t epoch_ms = cbm_unix_epoch_ms();
+    time_t after_seconds = time(NULL);
+
+    ASSERT(before_seconds >= 0);
+    ASSERT(after_seconds >= before_seconds);
+    ASSERT_GTE(epoch_ms, (uint64_t)before_seconds * UINT64_C(1000));
+    ASSERT_LT(epoch_ms, ((uint64_t)after_seconds + UINT64_C(2)) * UINT64_C(1000));
     PASS();
 }
 
@@ -618,6 +631,7 @@ SUITE(platform) {
     RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
+    RUN_TEST(platform_unix_epoch_ms_tracks_wall_clock);
     RUN_TEST(platform_nprocs);
     RUN_TEST(platform_file_exists);
     RUN_TEST(platform_is_dir);

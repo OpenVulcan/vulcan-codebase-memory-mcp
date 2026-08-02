@@ -11505,7 +11505,7 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
         project_db_path(change->project.project_key, database_path, sizeof(database_path));
         if (managed_database_available(change->project.project_key, database_path)) {
             (void)cbm_managed_project_registry_restore_snapshot(
-                srv->managed_projects, change->project.project_key, cbm_now_ms());
+                srv->managed_projects, change->project.project_key, cbm_unix_epoch_ms());
             bool watched = srv->managed_ops->watch_project(srv->managed_ops_context,
                                                            change->project.project_key,
                                                            change->project.canonical_root);

@@ -145,6 +145,21 @@ uint64_t cbm_now_ms(void) {
     return cbm_now_ns() / CBM_USEC_PER_SEC;
 }
 
+/* Return wall-clock Unix milliseconds without weakening monotonic deadline callers.
+ * 返回墙上时钟 Unix 毫秒数，同时不改变单调时钟截止时间调用方。 */
+uint64_t cbm_unix_epoch_ms(void) {
+    FILETIME file_time;
+    ULARGE_INTEGER ticks;
+    GetSystemTimeAsFileTime(&file_time);
+    ticks.LowPart = file_time.dwLowDateTime;
+    ticks.HighPart = file_time.dwHighDateTime;
+    const uint64_t milliseconds_since_1601 = ticks.QuadPart / UINT64_C(10000);
+    const uint64_t unix_epoch_offset_ms = UINT64_C(11644473600000);
+    return milliseconds_since_1601 >= unix_epoch_offset_ms
+               ? milliseconds_since_1601 - unix_epoch_offset_ms
+               : 0U;
+}
+
 int cbm_nprocs(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -283,6 +298,17 @@ uint64_t cbm_now_ns(void) {
 
 uint64_t cbm_now_ms(void) {
     return cbm_now_ns() / CBM_USEC_PER_SEC;
+}
+
+/* Return wall-clock Unix milliseconds without weakening monotonic deadline callers.
+ * 返回墙上时钟 Unix 毫秒数，同时不改变单调时钟截止时间调用方。 */
+uint64_t cbm_unix_epoch_ms(void) {
+    struct timespec timestamp;
+    if (clock_gettime(CLOCK_REALTIME, &timestamp) != 0 || timestamp.tv_sec < 0) {
+        return 0U;
+    }
+    return (uint64_t)timestamp.tv_sec * UINT64_C(1000) +
+           (uint64_t)timestamp.tv_nsec / UINT64_C(1000000);
 }
 
 /* ── System info ───────────────────────────── */

@@ -814,7 +814,7 @@ bool cbm_managed_project_registry_mark_offline(cbm_managed_project_registry_t *r
             cbm_managed_job_snapshot_t job = project->active_job;
             job.state = CBM_MANAGED_JOB_STATE_CANCELLED;
             job.phase = CBM_MANAGED_JOB_PHASE_FINALIZING;
-            job.updated_at_ms = cbm_now_ms();
+            job.updated_at_ms = cbm_unix_epoch_ms();
             job.completed_at_ms = job.updated_at_ms;
             managed_set_diagnostics(job.error_code, sizeof(job.error_code), job.error_message,
                                     sizeof(job.error_message), "project_offline",
