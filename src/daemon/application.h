@@ -34,6 +34,12 @@ typedef struct {
     int (*start)(void *context, const char *args_json, size_t memory_budget_bytes,
                  const char *marker_file, const char *quarantine_file,
                  cbm_daemon_application_worker_t *worker_out);
+    /* Start a worker whose complete log lines are delivered to one caller-owned callback.
+     * 启动一个把完整日志行交付给调用方回调的工作进程。 */
+    int (*start_with_log)(void *context, const char *args_json, size_t memory_budget_bytes,
+                          const char *marker_file, const char *quarantine_file,
+                          cbm_proc_log_cb log_callback, void *log_context,
+                          cbm_daemon_application_worker_t *worker_out);
     cbm_index_worker_poll_t (*poll)(void *context, cbm_daemon_application_worker_t worker,
                                     const cbm_index_worker_result_t **result_out);
     bool (*cancel)(void *context, cbm_daemon_application_worker_t worker);

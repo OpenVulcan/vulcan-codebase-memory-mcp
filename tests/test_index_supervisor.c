@@ -210,6 +210,45 @@ static void index_supervisor_test_capture_log(const char *line, void *context) {
     }
 }
 
+/*
+ * Reduce exact complete log events without allowing phase or unit regression.
+ * 归约精确完整日志事件，同时禁止阶段或工作单位倒退。
+ */
+TEST(index_progress_reducer_is_monotonic_and_ignores_unrelated_lines) {
+    /* Normalized progress snapshot under test.
+     * 被测规范化进度快照。 */
+    cbm_index_progress_snapshot_t progress = {0};
+    ASSERT(!cbm_index_progress_reduce_line(&progress, "level=info msg=unrelated value=1"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_NONE);
+    ASSERT(cbm_index_progress_reduce_line(
+        &progress, "level=info msg=pipeline.discover files=12 elapsed_ms=1"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_DISCOVERING);
+    ASSERT(cbm_index_progress_reduce_line(
+        &progress, "{\"level\":\"info\",\"event\":\"parallel.extract.progress\","
+                   "\"done\":\"4\",\"total\":\"12\"}"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_EXTRACTING);
+    ASSERT_EQ(progress.completed_units, 4);
+    ASSERT_EQ(progress.total_units, 12);
+    ASSERT(progress.has_total_units);
+    ASSERT(strcmp(progress.unit, "files") == 0);
+    ASSERT(cbm_index_progress_reduce_line(
+        &progress, "level=info msg=parallel.extract.progress done=2 total=10"));
+    ASSERT_EQ(progress.completed_units, 4);
+    ASSERT_EQ(progress.total_units, 12);
+    ASSERT(cbm_index_progress_reduce_line(&progress, "level=info msg=pass.start pass=tests"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_RESOLVING);
+    ASSERT(!progress.has_total_units);
+    ASSERT(cbm_index_progress_reduce_line(
+        &progress, "level=info msg=parallel.extract.progress done=12 total=12"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_RESOLVING);
+    ASSERT_EQ(progress.completed_units, 0);
+    ASSERT(cbm_index_progress_reduce_line(&progress, "level=info msg=gbuf.dump nodes=20 edges=30"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_PERSISTING);
+    ASSERT(cbm_index_progress_reduce_line(&progress, "level=info msg=pipeline.done nodes=20"));
+    ASSERT_EQ(progress.phase, CBM_INDEX_PROGRESS_PHASE_PUBLISHING);
+    PASS();
+}
+
 TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar) {
     const char *captured = cbm_index_supervisor_build_fingerprint();
     ASSERT_NOT_NULL(captured);
@@ -763,6 +802,7 @@ TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained) {
 }
 
 SUITE(index_supervisor) {
+    RUN_TEST(index_progress_reducer_is_monotonic_and_ignores_unrelated_lines);
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
     RUN_TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree);

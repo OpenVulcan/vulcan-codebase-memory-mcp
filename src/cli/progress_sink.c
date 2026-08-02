@@ -13,6 +13,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "mcp/index_supervisor.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -31,6 +32,9 @@ static FILE *s_out;
 static atomic_int s_needs_newline;
 static int s_gbuf_nodes = NOT_SET;
 static int s_gbuf_edges = NOT_SET;
+/* Normalized progress state shared with managed daemon reporting.
+ * 与托管 daemon 进度报告共享语义的规范化进度状态。 */
+static cbm_index_progress_snapshot_t s_progress_snapshot;
 static cbm_mutex_t s_sink_mutex;
 static atomic_int s_sink_mutex_state = ATOMIC_VAR_INIT(LOCK_UNINITIALIZED);
 
@@ -184,6 +188,7 @@ void cbm_progress_sink_init(FILE *out) {
     atomic_store(&s_needs_newline, 0);
     s_gbuf_nodes = NOT_SET;
     s_gbuf_edges = NOT_SET;
+    memset(&s_progress_snapshot, 0, sizeof(s_progress_snapshot));
     cbm_log_set_sink(cbm_progress_sink_fn);
     cbm_mutex_unlock(&s_sink_mutex);
 }
@@ -307,14 +312,13 @@ static void on_done(const char *line) {
 
 /* Handle parallel.extract.progress event — in-place counter. */
 static void on_extract_progress(const char *line) {
-    char done[CBM_SZ_32] = {0};
-    char total[CBM_SZ_32] = {0};
-    if (extract_kv(line, "done", done, (int)sizeof(done)) &&
-        extract_kv(line, "total", total, (int)sizeof(total))) {
-        long d = strtol(done, NULL, CBM_DECIMAL_BASE);
-        long t = strtol(total, NULL, CBM_DECIMAL_BASE);
-        int pct = (t > 0) ? (int)((d * PERCENT) / t) : 0;
-        (void)fprintf(s_out, "\r  Extracting: %ld/%ld files (%d%%)", d, t, pct);
+    (void)line;
+    if (s_progress_snapshot.has_total_units) {
+        uint64_t done = s_progress_snapshot.completed_units;
+        uint64_t total = s_progress_snapshot.total_units;
+        int percent = total > 0U ? (int)((done * PERCENT) / total) : 0;
+        (void)fprintf(s_out, "\r  Extracting: %llu/%llu files (%d%%)", (unsigned long long)done,
+                      (unsigned long long)total, percent);
         (void)fflush(s_out);
         atomic_store(&s_needs_newline, SKIP_ONE);
     }
@@ -345,6 +349,7 @@ void cbm_progress_sink_fn(const char *line) {
         cbm_mutex_unlock(&s_sink_mutex);
         return;
     }
+    (void)cbm_index_progress_reduce_line(&s_progress_snapshot, line);
     char msg[CBM_SZ_64] = {0};
     if (!extract_kv(line, "msg", msg, (int)sizeof(msg))) {
         cbm_mutex_unlock(&s_sink_mutex);

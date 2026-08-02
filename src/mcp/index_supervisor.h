@@ -23,8 +23,53 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
+
+/* Stable normalized phase derived from worker progress events.
+ * 从索引工作进程进度事件归约出的稳定阶段。 */
+typedef enum {
+    CBM_INDEX_PROGRESS_PHASE_NONE = 0,
+    CBM_INDEX_PROGRESS_PHASE_DISCOVERING,
+    CBM_INDEX_PROGRESS_PHASE_EXTRACTING,
+    CBM_INDEX_PROGRESS_PHASE_RESOLVING,
+    CBM_INDEX_PROGRESS_PHASE_PERSISTING,
+    CBM_INDEX_PROGRESS_PHASE_PUBLISHING,
+    CBM_INDEX_PROGRESS_PHASE_FINALIZING,
+} cbm_index_progress_phase_t;
+
+/* Normalized progress snapshot shared by CLI and managed daemon consumers.
+ * CLI 与托管 daemon 消费方共享的规范化进度快照。 */
+typedef struct {
+    /* Current monotonic indexing phase.
+     * 当前单调推进的索引阶段。 */
+    cbm_index_progress_phase_t phase;
+    /* Completed and total work units reported by the current phase.
+     * 当前阶段报告的已完成与总工作单位。 */
+    uint64_t completed_units;
+    uint64_t total_units;
+    /* Whether total_units is a stable denominator.
+     * total_units 是否为稳定分母。 */
+    bool has_total_units;
+    /* Bounded unit label, currently files when extraction reports counts.
+     * 有界的单位标签；当前提取阶段报告计数时为 files。 */
+    char unit[32];
+} cbm_index_progress_snapshot_t;
+
+/* Reduce one complete worker log line into a monotonic progress snapshot.
+ * 将一条完整工作进程日志归约进单调进度快照。
+ *
+ * Parameters:
+ * - snapshot: caller-owned state updated only for recognized progress events.
+ * - line: one complete structured or compact-JSON worker log line.
+ * Returns true when the line carried a recognized progress event.
+ *
+ * 参数：
+ * - snapshot：调用方持有的状态，仅在识别到进度事件时更新。
+ * - line：一条完整的结构化或紧凑 JSON 工作进程日志。
+ * 识别到进度事件时返回 true。 */
+bool cbm_index_progress_reduce_line(cbm_index_progress_snapshot_t *snapshot, const char *line);
 
 /* Worker-role state, set once from the CLI arg parser (main.c) when this process
  * was spawned as a supervised worker. When active, indexing must run in-process

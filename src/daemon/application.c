@@ -147,6 +147,15 @@ struct cbm_daemon_application_job {
      * 与 MCP session
      * 无关的注册表所有后台生命周期。 */
     bool managed_owner;
+    /* Exact managed registry identity attached before the worker thread starts.
+     * 在工作线程启动前绑定的精确托管注册表身份。 */
+    uint64_t managed_runtime_id;
+    uint64_t managed_job_id;
+    cbm_managed_job_mode_t managed_mode;
+    cbm_managed_job_trigger_t managed_trigger;
+    /* Monotonic normalized progress reduced from complete worker log lines.
+     * 从完整工作进程日志行归约出的单调规范化进度。 */
+    cbm_index_progress_snapshot_t managed_progress;
     cbm_daemon_application_job_t *next;
 };
 
@@ -217,14 +226,14 @@ static void *application_job_thread(void *opaque);
 static char *application_auto_index_args(const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
-    const char *args_json, application_job_subscribe_status_t *status_out);
+    const char *args_json, const cbm_managed_job_snapshot_t *managed_job,
+    application_job_subscribe_status_t *status_out);
 /* Schedule one registry-owned index without a session subscriber.
  * 在没有 session subscriber
  * 的情况下调度一个注册表所有索引。 */
-static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *context,
-                                                                         const char *project_key,
-                                                                         const char *canonical_root,
-                                                                         bool force);
+static cbm_mcp_managed_index_status_t application_managed_schedule_index(
+    void *context, const char *project_key, const char *canonical_root,
+    cbm_mcp_managed_index_mode_t mode, cbm_mcp_managed_index_trigger_t trigger);
 /* Register or repair one registry-owned watcher for an exact key/root pair.
  *
  * 为精确项目键与根路径组合注册或修复一个注册表所有 watcher。 */
@@ -327,6 +336,62 @@ static int application_worker_start_default(void *context, const char *args_json
                                         quarantine_file, &worker);
     *worker_out = worker;
     return result;
+}
+
+/* Start the production worker with request-scoped complete log delivery.
+ * 启动生产工作进程，并按请求交付完整日志行。 */
+static int application_worker_start_with_log_default(
+    void *context, const char *args_json, size_t memory_budget_bytes, const char *marker_file,
+    const char *quarantine_file, cbm_proc_log_cb log_callback, void *log_context,
+    cbm_daemon_application_worker_t *worker_out) {
+    (void)context;
+    cbm_index_worker_handle_t *worker = NULL;
+    int result =
+        cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
+                                        quarantine_file, log_callback, log_context, &worker);
+    *worker_out = worker;
+    return result;
+}
+
+/* Map a supervisor progress phase to the managed registry contract.
+ * 将监督器进度阶段映射为托管注册表契约。 */
+static cbm_managed_job_phase_t application_managed_progress_phase(
+    cbm_index_progress_phase_t phase) {
+    switch (phase) {
+    case CBM_INDEX_PROGRESS_PHASE_DISCOVERING:
+        return CBM_MANAGED_JOB_PHASE_DISCOVERING;
+    case CBM_INDEX_PROGRESS_PHASE_EXTRACTING:
+        return CBM_MANAGED_JOB_PHASE_EXTRACTING;
+    case CBM_INDEX_PROGRESS_PHASE_RESOLVING:
+        return CBM_MANAGED_JOB_PHASE_RESOLVING;
+    case CBM_INDEX_PROGRESS_PHASE_PERSISTING:
+        return CBM_MANAGED_JOB_PHASE_PERSISTING;
+    case CBM_INDEX_PROGRESS_PHASE_PUBLISHING:
+        return CBM_MANAGED_JOB_PHASE_PUBLISHING;
+    case CBM_INDEX_PROGRESS_PHASE_FINALIZING:
+        return CBM_MANAGED_JOB_PHASE_FINALIZING;
+    case CBM_INDEX_PROGRESS_PHASE_NONE:
+    default:
+        return CBM_MANAGED_JOB_PHASE_QUEUED;
+    }
+}
+
+/* Reduce one managed worker log line and publish exact-job progress.
+ * 归约一条托管工作进程日志，并发布精确任务进度。 */
+static void application_managed_worker_log(const char *line, void *context) {
+    cbm_daemon_application_job_t *job = context;
+    if (!job || job->managed_runtime_id == 0U || job->managed_job_id == 0U || !job->application ||
+        !job->application->managed_projects) {
+        return;
+    }
+    if (!cbm_index_progress_reduce_line(&job->managed_progress, line)) {
+        return;
+    }
+    (void)cbm_managed_project_registry_update_job_progress(
+        job->application->managed_projects, job->project_key, job->managed_runtime_id,
+        job->managed_job_id, application_managed_progress_phase(job->managed_progress.phase),
+        job->managed_progress.completed_units, job->managed_progress.total_units,
+        job->managed_progress.has_total_units, job->managed_progress.unit, cbm_now_ms());
 }
 
 static cbm_index_worker_poll_t application_worker_poll_default(
@@ -1098,9 +1163,15 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
 
     cbm_daemon_application_worker_t worker = NULL;
     application_tmp_lock();
-    int start_result = application->worker_ops.start(
-        application->worker_ops.context, job->args_json, application->worker_memory_budget_bytes,
-        marker_path, quarantine_path, &worker);
+    int start_result =
+        application->worker_ops.start_with_log
+            ? application->worker_ops.start_with_log(
+                  application->worker_ops.context, job->args_json,
+                  application->worker_memory_budget_bytes, marker_path, quarantine_path,
+                  application_managed_worker_log, job, &worker)
+            : application->worker_ops.start(application->worker_ops.context, job->args_json,
+                                            application->worker_memory_budget_bytes, marker_path,
+                                            quarantine_path, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1111,6 +1182,12 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     job->worker = worker;
     bool cancel_now = job->cancel_requested || application->stopping;
     cbm_mutex_unlock(&application->mutex);
+    if (job->managed_runtime_id != 0U && job->managed_job_id != 0U &&
+        application->managed_projects) {
+        (void)cbm_managed_project_registry_mark_job_running(
+            application->managed_projects, job->project_key, job->managed_runtime_id,
+            job->managed_job_id, cbm_now_ms());
+    }
     if (cancel_now) {
         /* The worker thread owns this handle until destroy below. Invoke the
          * external supervisor without the application mutex held. */
@@ -1439,7 +1516,7 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
         }
         application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
         cbm_daemon_application_job_t *retry = application_job_subscribe_locked(
-            application, project, root_path, args, &subscribe_status);
+            application, project, root_path, args, NULL, &subscribe_status);
         free(args);
         if (retry) {
             session->auto_index_job = retry;
@@ -1486,12 +1563,31 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         /* Whether the terminal result reached the authoritative entry.
          *
          * 终态结果是否已发布到权威条目。 */
+        /* Exact terminal state published for this immutable job identity.
+         * 为该不可变任务身份发布的精确终态。 */
+        cbm_managed_job_state_t terminal_state =
+            job->cancelled ? CBM_MANAGED_JOB_STATE_CANCELLED
+                           : (job->successful ? CBM_MANAGED_JOB_STATE_SUCCEEDED
+                                              : CBM_MANAGED_JOB_STATE_FAILED);
+        uint64_t completed_at_ms = cbm_now_ms();
+        if (authoritative) {
+            (void)cbm_managed_project_registry_update_job_progress(
+                application->managed_projects, job->project_key, job->managed_runtime_id,
+                job->managed_job_id, CBM_MANAGED_JOB_PHASE_FINALIZING, 0U, 0U, false, NULL,
+                completed_at_ms);
+        }
+        /* Whether the terminal result reached the authoritative exact job.
+         * 终态结果是否已到达权威的精确任务。 */
         bool published =
             authoritative &&
-            cbm_managed_project_registry_publish_index(
-                application->managed_projects, job->project_key, job->successful, cbm_now_ms(),
-                job->supervision_failed ? "index_supervision_failed" : "index_failed",
-                job->successful ? NULL : "Managed index did not commit");
+            cbm_managed_project_registry_publish_job(
+                application->managed_projects, job->project_key, job->managed_runtime_id,
+                job->managed_job_id, terminal_state, completed_at_ms,
+                job->supervision_failed ? "index_supervision_failed"
+                                        : (job->cancelled ? "index_cancelled" : "index_failed"),
+                job->successful ? NULL
+                                : (job->cancelled ? "Managed index was cancelled"
+                                                  : "Managed index did not commit"));
         if (published && !cbm_is_dir(job->root_path)) {
             /*
              * Preserve a successful revision or failure diagnostic while
@@ -1520,8 +1616,8 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
                     (void)cbm_managed_project_registry_mark_offline(application->managed_projects,
                                                                     job->project_key);
                 } else {
-                    (void)cbm_managed_project_registry_publish_index(
-                        application->managed_projects, job->project_key, false, cbm_now_ms(),
+                    (void)cbm_managed_project_registry_mark_degraded(
+                        application->managed_projects, job->project_key,
                         "watch_registration_failed", "Managed watcher registration failed");
                 }
             }
@@ -1671,7 +1767,8 @@ static bool application_index_args_equal(const char *left, const char *right) {
  * this admission in the same critical section closes the unwatch race. */
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
-    const char *args_json, application_job_subscribe_status_t *status_out) {
+    const char *args_json, const cbm_managed_job_snapshot_t *managed_job,
+    application_job_subscribe_status_t *status_out) {
     *status_out = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     if (application->stopping) {
         return NULL;
@@ -1688,6 +1785,13 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
             return NULL;
         }
         job->subscribers++;
+        if (managed_job) {
+            job->managed_owner = true;
+            job->managed_runtime_id = managed_job->runtime_id;
+            job->managed_job_id = managed_job->job_id;
+            job->managed_mode = managed_job->mode;
+            job->managed_trigger = managed_job->trigger;
+        }
         *status_out = APPLICATION_JOB_SUBSCRIBE_OK;
         return job;
     }
@@ -1713,6 +1817,13 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
     }
     job->application = application;
     job->subscribers = 1;
+    if (managed_job) {
+        job->managed_owner = true;
+        job->managed_runtime_id = managed_job->runtime_id;
+        job->managed_job_id = managed_job->job_id;
+        job->managed_mode = managed_job->mode;
+        job->managed_trigger = managed_job->trigger;
+    }
     job->next = application->jobs;
     application->jobs = job;
     if (application_job_thread_create(&job->thread, job) == 0) {
@@ -1738,7 +1849,7 @@ static cbm_daemon_application_job_t *application_job_subscribe(
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     cbm_daemon_application_job_t *job = application_job_subscribe_locked(
-        application, project_key, root_path, args_json, status_out);
+        application, project_key, root_path, args_json, NULL, status_out);
     cbm_mutex_unlock(&application->mutex);
     return job;
 }
@@ -2060,7 +2171,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
     if (attempt_auto_index && args) {
         application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
         cbm_daemon_application_job_t *job = application_job_subscribe_locked(
-            application, project, root_path, args, &subscribe_status);
+            application, project, root_path, args, NULL, &subscribe_status);
         if (job) {
             session->auto_index_job = job;
             session->auto_index_subscribed = true;
@@ -2345,7 +2456,8 @@ static char *application_index_execute(void *context, const char *root_path,
  * 返回调用方拥有的 JSON；分配失败时返回 NULL。
 
  */
-static char *application_managed_index_args(const char *project_key, const char *canonical_root) {
+static char *application_managed_index_args(const char *project_key, const char *canonical_root,
+                                            cbm_managed_job_mode_t mode) {
     if (!project_key || !project_key[0] || !canonical_root || !canonical_root[0]) {
         return NULL;
     }
@@ -2370,6 +2482,9 @@ static char *application_managed_index_args(const char *project_key, const char 
         encoded = yyjson_mut_obj_add_strcpy(document, root, "name", project_key);
     }
     free(default_project);
+    if (encoded && mode == CBM_MANAGED_JOB_MODE_REBUILD) {
+        encoded = yyjson_mut_obj_add_bool(document, root, "_vulcan_force_rebuild", true);
+    }
     /* Serialized argument object.
      * 序列化参数对象。 */
     char *arguments = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
@@ -2438,24 +2553,67 @@ static void application_managed_unwatch_project(void *context, const char *proje
 
  * * 在保持 daemon 全局并发有界的同时调度一个注册表所有物理索引。
  */
-static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *context,
-                                                                         const char *project_key,
-                                                                         const char *canonical_root,
-                                                                         bool force) {
+static cbm_mcp_managed_index_status_t application_managed_schedule_index(
+    void *context, const char *project_key, const char *canonical_root,
+    cbm_mcp_managed_index_mode_t requested_mode,
+    cbm_mcp_managed_index_trigger_t requested_trigger) {
     /* Owning daemon application.
      * 所属 daemon application。 */
     cbm_daemon_application_t *application = context;
-    (void)force;
     if (!application || !application->vulcan_managed || !application->managed_projects ||
         !project_key || !canonical_root ||
         !cbm_managed_project_registry_contains(application->managed_projects, project_key,
                                                canonical_root)) {
         return CBM_MCP_MANAGED_INDEX_FAILED;
     }
+    /* Registry operation mode derived from the closed MCP contract.
+     * 从封闭 MCP 契约派生的注册表操作模式。 */
+    cbm_managed_job_mode_t mode;
+    if (requested_mode == CBM_MCP_MANAGED_INDEX_MODE_UPDATE) {
+        mode = CBM_MANAGED_JOB_MODE_UPDATE;
+    } else if (requested_mode == CBM_MCP_MANAGED_INDEX_MODE_REBUILD) {
+        mode = CBM_MANAGED_JOB_MODE_REBUILD;
+    } else {
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
+    /* Registry request source derived from the closed MCP contract.
+     * 从封闭 MCP 契约派生的注册表请求来源。 */
+    cbm_managed_job_trigger_t trigger;
+    switch (requested_trigger) {
+    case CBM_MCP_MANAGED_INDEX_TRIGGER_INITIAL:
+        trigger = CBM_MANAGED_JOB_TRIGGER_INITIAL;
+        break;
+    case CBM_MCP_MANAGED_INDEX_TRIGGER_WATCHER:
+        trigger = CBM_MANAGED_JOB_TRIGGER_WATCHER;
+        break;
+    case CBM_MCP_MANAGED_INDEX_TRIGGER_MANUAL:
+        trigger = CBM_MANAGED_JOB_TRIGGER_MANUAL;
+        break;
+    case CBM_MCP_MANAGED_INDEX_TRIGGER_RECOVERY:
+        trigger = CBM_MANAGED_JOB_TRIGGER_RECOVERY;
+        break;
+    default:
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
     /* Canonical index arguments.
      * 规范化索引参数。 */
-    char *arguments = application_managed_index_args(project_key, canonical_root);
+    char *arguments = application_managed_index_args(project_key, canonical_root, mode);
     if (!arguments) {
+        return CBM_MCP_MANAGED_INDEX_FAILED;
+    }
+
+    /* Exact registry job identity created before any worker thread can start.
+     * 在任何工作线程启动前创建的精确注册表任务身份。 */
+    cbm_managed_job_snapshot_t managed_job = {0};
+    cbm_managed_job_begin_status_t begin_status = cbm_managed_project_registry_begin_job(
+        application->managed_projects, project_key, mode, trigger, cbm_now_ms(), &managed_job);
+    if (begin_status == CBM_MANAGED_JOB_BEGIN_CONFLICT) {
+        free(arguments);
+        return CBM_MCP_MANAGED_INDEX_CONFLICT;
+    }
+    if (begin_status != CBM_MANAGED_JOB_BEGIN_STARTED &&
+        begin_status != CBM_MANAGED_JOB_BEGIN_COALESCED) {
+        free(arguments);
         return CBM_MCP_MANAGED_INDEX_FAILED;
     }
 
@@ -2500,7 +2658,7 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *c
          *
          * 共享协调器选择或创建的物理任务。 */
         cbm_daemon_application_job_t *job = application_job_subscribe_locked(
-            application, project_key, canonical_root, arguments, &subscribe_status);
+            application, project_key, canonical_root, arguments, &managed_job, &subscribe_status);
         if (job) {
             started = existing == NULL;
             /* Transfer the temporary ordinary subscription to the registry.
@@ -2519,7 +2677,8 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *c
          *
          * 有界队列是否可以继续等待。
          */
-        bool retry = !application->stopping &&
+        bool stopping = application->stopping;
+        bool retry = !stopping &&
                      (subscribe_status == APPLICATION_JOB_SUBSCRIBE_BUSY ||
                       subscribe_status == APPLICATION_JOB_SUBSCRIBE_CANCELLING) &&
                      cbm_managed_project_registry_contains(application->managed_projects,
@@ -2527,13 +2686,31 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(void *c
         cbm_mutex_unlock(&application->mutex);
         if (!retry) {
             free(arguments);
+            if (begin_status == CBM_MANAGED_JOB_BEGIN_STARTED) {
+                cbm_managed_job_state_t terminal_state =
+                    stopping ? CBM_MANAGED_JOB_STATE_CANCELLED : CBM_MANAGED_JOB_STATE_FAILED;
+                const char *error_code =
+                    subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT
+                        ? "index_options_conflict"
+                        : "index_admission_failed";
+                const char *error_message =
+                    subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT
+                        ? "Another index operation for this project uses different options"
+                        : "Managed index worker could not be admitted";
+                (void)cbm_managed_project_registry_publish_job(
+                    application->managed_projects, project_key, managed_job.runtime_id,
+                    managed_job.job_id, terminal_state, cbm_now_ms(), error_code, error_message);
+            }
+            if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
+                return CBM_MCP_MANAGED_INDEX_CONFLICT;
+            }
             return CBM_MCP_MANAGED_INDEX_FAILED;
         }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(arguments);
-    (void)cbm_managed_project_registry_mark_indexing(application->managed_projects, project_key);
-    return started ? CBM_MCP_MANAGED_INDEX_STARTED : CBM_MCP_MANAGED_INDEX_RUNNING;
+    return started && begin_status == CBM_MANAGED_JOB_BEGIN_STARTED ? CBM_MCP_MANAGED_INDEX_STARTED
+                                                                    : CBM_MCP_MANAGED_INDEX_RUNNING;
 }
 
 /* Cancel only the registry-owned claim for a removed managed project.
@@ -3130,6 +3307,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         application->worker_ops = (cbm_daemon_application_worker_ops_t){
             .context = NULL,
             .start = application_worker_start_default,
+            .start_with_log = application_worker_start_with_log_default,
             .poll = application_worker_poll_default,
             .cancel = application_worker_cancel_default,
             .log_path = application_worker_log_path_default,
@@ -3582,7 +3760,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     bool watch_subscriptions_ok = true;
     cbm_daemon_application_job_t *job =
         watch_live ? application_job_subscribe_locked(application, project_key, canonical_root,
-                                                      args, &subscribe_status)
+                                                      args, NULL, &subscribe_status)
                    : NULL;
     if (job && require_live_watch) {
         watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
@@ -3663,19 +3841,38 @@ int cbm_daemon_application_watcher_index(const char *project_name, const char *r
          * subscription. It may safely finish after every session exits.
          * 托管 watcher
          * 工作由注册表拥有，绝不由 live session 订阅拥有。 */
-        cbm_mcp_managed_index_status_t scheduled =
-            application_managed_schedule_index(application, project_name, root_path, false);
-        if (scheduled == CBM_MCP_MANAGED_INDEX_FAILED) {
+        cbm_mcp_managed_index_status_t scheduled = application_managed_schedule_index(
+            application, project_name, root_path, CBM_MCP_MANAGED_INDEX_MODE_UPDATE,
+            CBM_MCP_MANAGED_INDEX_TRIGGER_WATCHER);
+        if (scheduled == CBM_MCP_MANAGED_INDEX_FAILED ||
+            scheduled == CBM_MCP_MANAGED_INDEX_CONFLICT) {
             return 1;
         }
+        /* Exact job identity observed immediately after scheduling.
+         * 调度后立即观察到的精确任务身份。 */
+        cbm_managed_project_entry_t scheduled_project = {0};
+        if (!cbm_managed_project_registry_get_by_key(application->managed_projects, project_name,
+                                                     &scheduled_project) ||
+            !scheduled_project.has_active_job) {
+            return 1;
+        }
+        uint64_t runtime_id = scheduled_project.active_job.runtime_id;
+        uint64_t job_id = scheduled_project.active_job.job_id;
         for (;;) {
             cbm_managed_project_entry_t project = {0};
             if (!cbm_managed_project_registry_get_by_key(application->managed_projects,
                                                          project_name, &project)) {
                 return 1;
             }
-            if (project.lifecycle != CBM_MANAGED_PROJECT_INDEXING) {
-                return project.lifecycle == CBM_MANAGED_PROJECT_READY ? 0 : 1;
+            if (project.has_active_job && project.active_job.runtime_id == runtime_id &&
+                project.active_job.job_id == job_id) {
+                /* The exact job remains active; continue bounded polling.
+                 * 精确任务仍处于活动状态；继续有界轮询。 */
+            } else if (project.has_last_job && project.last_job.runtime_id == runtime_id &&
+                       project.last_job.job_id == job_id) {
+                return project.last_job.state == CBM_MANAGED_JOB_STATE_SUCCEEDED ? 0 : 1;
+            } else {
+                return 1;
             }
             cbm_mutex_lock(&application->mutex);
             bool stopping = application->stopping;

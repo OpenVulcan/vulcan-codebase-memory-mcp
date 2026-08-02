@@ -2298,7 +2298,7 @@ TEST(pipeline_swift_cross_package_import) {
     cbm_edge_t *edges = NULL;
     int ec = 0;
     ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
-             CBM_STORE_OK);
+              CBM_STORE_OK);
 
     bool found_exact_edge = false;
     for (int i = 0; i < ec; i++) {
@@ -5420,17 +5420,16 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
  * above for the full end-to-end proof. */
 
 TEST(pkgmap_swift_targets_registers_module) {
-    static const char src[] =
-        "// swift-tools-version:5.9\n"
-        "import PackageDescription\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
-        ")\n";
+    static const char src[] = "// swift-tools-version:5.9\n"
+                              "import PackageDescription\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -5451,8 +5450,8 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
     ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
@@ -5471,15 +5470,14 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
  * fixture in this file happens to follow `name:` with `dependencies:` or a
  * comma, so this specific shape was previously untested and unnoticed. */
 TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\")]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\")]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -5497,8 +5495,8 @@ TEST(pkgmap_swift_target_honors_literal_path) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
@@ -5512,16 +5510,15 @@ TEST(pkgmap_swift_target_honors_literal_path) {
  * target entirely (fail closed), even though its `name:` is a valid
  * literal. */
 TEST(pkgmap_swift_target_computed_path_fails_closed) {
-    static const char src[] =
-        "let customPath = computePath()\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", path: customPath)]\n"
-        ")\n";
+    static const char src[] = "let customPath = computePath()\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", path: customPath)]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_EQ(entries.count, 0);
     cbm_pkg_entries_free(&entries);
@@ -5543,8 +5540,8 @@ TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
@@ -5573,8 +5570,8 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -5589,18 +5586,17 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
  * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
  * products/targets, so neither mints an entry. */
 TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"App\",\n"
-        "    targets: [.target(name: \"App\", dependencies: [\n"
-        "        \"Core\",\n"
-        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
-        "    ])]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"App\",\n"
+                              "    targets: [.target(name: \"App\", dependencies: [\n"
+                              "        \"Core\",\n"
+                              "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+                              "    ])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -6346,10 +6342,9 @@ TEST(incremental_new_file_added) {
 }
 
 /* Cancellation at the final publish boundary must never destroy the last good
- * full index. Adding two files to the two-file baseline deliberately exceeds
- * the incremental router's 1.5x file-count bound (4 > 2 + 2/2), forcing the
- * full-reindex path while an existing committed DB is present. */
-TEST(cancelled_full_reindex_preserves_committed_db) {
+ * index when the controller explicitly requests a clean rebuild.
+ * 当控制器显式请求干净重建时，最终发布边界上的取消绝不能破坏最近的有效索引。 */
+TEST(cancelled_forced_rebuild_preserves_committed_db) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -6382,6 +6377,7 @@ TEST(cancelled_full_reindex_preserves_committed_db) {
     };
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_force_rebuild(p, true);
     cbm_pipeline_set_before_publish_hook_for_tests(p, cancel_at_publish_boundary, &hook);
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
@@ -7975,7 +7971,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
-    RUN_TEST(cancelled_full_reindex_preserves_committed_db);
+    RUN_TEST(cancelled_forced_rebuild_preserves_committed_db);
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);

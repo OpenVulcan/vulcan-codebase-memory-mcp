@@ -34,6 +34,197 @@
 _Static_assert(CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE == CBM_DAEMON_BUILD_FINGERPRINT_SIZE,
                "worker and daemon build fingerprint sizes must match");
 
+/* Extract one quoted field from the logger's compact JSON object.
+ * 从日志器的紧凑 JSON 对象中提取一个带引号字段。 */
+static const char *index_progress_extract_json_field(const char *line, const char *key,
+                                                     char *buffer, size_t buffer_size) {
+    if (!line || !key || !buffer || buffer_size == 0U) {
+        return NULL;
+    }
+    char needle[CBM_SZ_64] = {0};
+    int needle_length = snprintf(needle, sizeof(needle), "\"%s\":", key);
+    if (needle_length <= 0 || (size_t)needle_length >= sizeof(needle)) {
+        return NULL;
+    }
+    const char *candidate = line;
+    while ((candidate = strstr(candidate, needle)) != NULL) {
+        const char *before = candidate;
+        while (before > line && (before[-1] == ' ' || before[-1] == '\t')) {
+            before--;
+        }
+        if (before != line && before[-1] != '{' && before[-1] != ',') {
+            candidate += needle_length;
+            continue;
+        }
+        const char *value = candidate + needle_length;
+        while (*value == ' ' || *value == '\t') {
+            value++;
+        }
+        if (*value++ != '"') {
+            return NULL;
+        }
+        size_t offset = 0U;
+        bool escaped = false;
+        while (*value && offset + 1U < buffer_size) {
+            if (!escaped && *value == '"') {
+                buffer[offset] = '\0';
+                return buffer;
+            }
+            if (!escaped && *value == '\\') {
+                escaped = true;
+                value++;
+                continue;
+            }
+            if (escaped) {
+                switch (*value) {
+                case 'n':
+                    buffer[offset++] = '\n';
+                    break;
+                case 'r':
+                    buffer[offset++] = '\r';
+                    break;
+                case 't':
+                    buffer[offset++] = '\t';
+                    break;
+                default:
+                    buffer[offset++] = *value;
+                    break;
+                }
+                escaped = false;
+            } else {
+                buffer[offset++] = *value;
+            }
+            value++;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Extract one value from structured key-value or compact JSON worker logs.
+ * 从结构化键值或紧凑 JSON 工作进程日志中提取一个值。 */
+static const char *index_progress_extract_value(const char *line, const char *key, char *buffer,
+                                                size_t buffer_size) {
+    if (!line || !key || !buffer || buffer_size == 0U) {
+        return NULL;
+    }
+    size_t key_length = strlen(key);
+    for (const char *cursor = line; *cursor; cursor++) {
+        if ((cursor == line || cursor[-1] == ' ') && strncmp(cursor, key, key_length) == 0 &&
+            cursor[key_length] == '=') {
+            const char *value = cursor + key_length + 1U;
+            size_t length = 0U;
+            while (value[length] && value[length] != ' ' && length + 1U < buffer_size) {
+                buffer[length] = value[length];
+                length++;
+            }
+            buffer[length] = '\0';
+            return buffer;
+        }
+    }
+    return index_progress_extract_json_field(line, strcmp(key, "msg") == 0 ? "event" : key, buffer,
+                                             buffer_size);
+}
+
+/* Parse one unsigned decimal value without accepting partial or signed input.
+ * 解析一个无符号十进制值，不接受部分匹配或带符号输入。 */
+static bool index_progress_parse_u64(const char *value, uint64_t *value_out) {
+    if (!value || !value[0] || !value_out || value[0] == '-' || value[0] == '+') {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *value_out = (uint64_t)parsed;
+    return true;
+}
+
+/* Advance a normalized snapshot without allowing late log lines to regress phase.
+ * 推进规范化快照，不允许迟到日志使阶段倒退。
+ *
+ * Returns true when the requested phase is current and may update its counters.
+ * 当请求阶段为当前有效阶段、允许更新该阶段计数时返回 true。 */
+static bool index_progress_advance(cbm_index_progress_snapshot_t *snapshot,
+                                   cbm_index_progress_phase_t phase) {
+    if (phase < snapshot->phase) {
+        return false;
+    }
+    if (phase != snapshot->phase) {
+        snapshot->completed_units = 0U;
+        snapshot->total_units = 0U;
+        snapshot->has_total_units = false;
+        snapshot->unit[0] = '\0';
+    }
+    snapshot->phase = phase;
+    return true;
+}
+
+bool cbm_index_progress_reduce_line(cbm_index_progress_snapshot_t *snapshot, const char *line) {
+    if (!snapshot || !line) {
+        return false;
+    }
+    char event[CBM_SZ_64] = {0};
+    if (!index_progress_extract_value(line, "msg", event, sizeof(event))) {
+        return false;
+    }
+    if (strcmp(event, "pipeline.discover") == 0 || strcmp(event, "pipeline.route") == 0) {
+        (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_DISCOVERING);
+        return true;
+    }
+    if (strcmp(event, "parallel.extract.progress") == 0) {
+        /* Whether this extraction event still belongs to the current phase.
+         * 此提取事件是否仍属于当前阶段。 */
+        bool current_phase = index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_EXTRACTING);
+        char completed[CBM_SZ_32] = {0};
+        char total[CBM_SZ_32] = {0};
+        uint64_t completed_units = 0U;
+        uint64_t total_units = 0U;
+        if (current_phase &&
+            index_progress_extract_value(line, "done", completed, sizeof(completed)) &&
+            index_progress_extract_value(line, "total", total, sizeof(total)) &&
+            index_progress_parse_u64(completed, &completed_units) &&
+            index_progress_parse_u64(total, &total_units)) {
+            if (completed_units > snapshot->completed_units) {
+                snapshot->completed_units = completed_units;
+            }
+            if (!snapshot->has_total_units || total_units > snapshot->total_units) {
+                snapshot->total_units = total_units;
+            }
+            snapshot->has_total_units = true;
+            (void)snprintf(snapshot->unit, sizeof(snapshot->unit), "%s", "files");
+        }
+        return true;
+    }
+    if (strcmp(event, "pass.start") == 0 || strcmp(event, "pass.timing") == 0) {
+        char pass[CBM_SZ_64] = {0};
+        if (!index_progress_extract_value(line, "pass", pass, sizeof(pass))) {
+            return true;
+        }
+        if (strcmp(pass, "structure") == 0 || strcmp(pass, "parallel_extract") == 0 ||
+            strcmp(pass, "registry_build") == 0) {
+            (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_EXTRACTING);
+        } else if (strcmp(pass, "parallel_resolve") == 0 || strcmp(pass, "tests") == 0 ||
+                   strcmp(pass, "httplinks") == 0 || strcmp(pass, "githistory_compute") == 0 ||
+                   strcmp(pass, "configlink") == 0) {
+            (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_RESOLVING);
+        } else if (strcmp(pass, "dump") == 0) {
+            (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_PERSISTING);
+        }
+        return true;
+    }
+    if (strcmp(event, "gbuf.dump") == 0) {
+        (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_PERSISTING);
+        return true;
+    }
+    if (strcmp(event, "pipeline.done") == 0) {
+        (void)index_progress_advance(snapshot, CBM_INDEX_PROGRESS_PHASE_PUBLISHING);
+        return true;
+    }
+    return false;
+}
+
 /* ── Worker-role state ────────────────────────────────────────────── */
 
 static bool g_worker_active = false;

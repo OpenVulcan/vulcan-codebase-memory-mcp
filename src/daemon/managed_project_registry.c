@@ -6,10 +6,20 @@
 #include "daemon/managed_project_registry.h"
 
 #include "foundation/compat_thread.h"
+#include "foundation/platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 /* Registry storage guarded by one dedicated mutex.
  * 由一个专用互斥锁保护的注册表存储。 */
@@ -29,7 +39,64 @@ struct cbm_managed_project_registry {
     /* Last committed full-sync generation.
      * 最近提交的全量同步 generation。 */
     uint64_t generation;
+    /* Process runtime generation used to reject stale job events.
+     * 用于拒绝陈旧任务事件的进程运行代次。 */
+    uint64_t runtime_id;
+    /* Next runtime-unique job identifier.
+     * 下一个运行时唯一任务标识。 */
+    uint64_t next_job_id;
 };
+
+/* Return the operating-system process identifier.
+ * 返回操作系统进程标识。 */
+static uint64_t managed_current_pid(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
+/* Build a process-scoped runtime generation from monotonic time and pid.
+ * 使用单调时间与进程标识构造进程级运行代次。 */
+static uint64_t managed_runtime_id(void) {
+    uint64_t mixed = (cbm_now_ms() + 1U) * 11400714819323198485ULL;
+    mixed ^= (managed_current_pid() + 1U) * 14029467366897019727ULL;
+    return mixed != 0U ? mixed : 1U;
+}
+
+/* Clear bounded diagnostics without changing job identity.
+ * 清空有界诊断信息且不改变任务身份。 */
+static void managed_clear_diagnostics(char *error_code, size_t error_code_size, char *error_message,
+                                      size_t error_message_size) {
+    if (error_code && error_code_size > 0U) {
+        error_code[0] = '\0';
+    }
+    if (error_message && error_message_size > 0U) {
+        error_message[0] = '\0';
+    }
+}
+
+/* Copy optional terminal diagnostics into bounded storage.
+ * 将可选终态诊断复制到有界存储。 */
+static void managed_set_diagnostics(char *error_code, size_t error_code_size, char *error_message,
+                                    size_t error_message_size, const char *code,
+                                    const char *message) {
+    if (error_code && error_code_size > 0U) {
+        (void)snprintf(error_code, error_code_size, "%s", code ? code : "index_failed");
+    }
+    if (error_message && error_message_size > 0U) {
+        (void)snprintf(error_message, error_message_size, "%s",
+                       message ? message : "Managed index failed");
+    }
+}
+
+/* Return true when a job state is terminal.
+ * 当任务状态为终态时返回真。 */
+static bool managed_job_state_is_terminal(cbm_managed_job_state_t state) {
+    return state == CBM_MANAGED_JOB_STATE_SUCCEEDED || state == CBM_MANAGED_JOB_STATE_FAILED ||
+           state == CBM_MANAGED_JOB_STATE_CANCELLED;
+}
 
 /* Copy bounded text and reject truncation.
  * 复制有界文本并拒绝截断。
@@ -176,6 +243,8 @@ cbm_managed_project_registry_t *cbm_managed_project_registry_new(void) {
     }
     cbm_mutex_init(&registry->mutex);
     cbm_mutex_init(&registry->reconcile_mutex);
+    registry->runtime_id = managed_runtime_id();
+    registry->next_job_id = 1U;
     return registry;
 }
 
@@ -249,8 +318,9 @@ bool cbm_managed_project_registry_sync(cbm_managed_project_registry_t *registry,
             free(next_projects);
             return false;
         }
-        entry->lifecycle =
-            input->root_available ? CBM_MANAGED_PROJECT_PENDING : CBM_MANAGED_PROJECT_OFFLINE;
+        entry->availability = input->root_available ? CBM_MANAGED_AVAILABILITY_UNAVAILABLE
+                                                    : CBM_MANAGED_AVAILABILITY_OFFLINE;
+        entry->next_job_generation = 1U;
         for (size_t prior = 0U; prior < index; prior++) {
             if (strcmp(next_projects[prior].project_id, entry->project_id) == 0 ||
                 managed_path_equal(next_projects[prior].canonical_root, entry->canonical_root) ||
@@ -332,11 +402,15 @@ bool cbm_managed_project_registry_sync(cbm_managed_project_registry_t *registry,
             }
             /* Availability is authoritative for lifecycle and watcher ownership.
              * 可用性对生命周期和 watcher 所有权具有权威性。 */
-            cbm_managed_project_lifecycle_t requested_lifecycle = next->lifecycle;
+            cbm_managed_availability_t requested_availability = next->availability;
             *next = *existing;
-            if (requested_lifecycle == CBM_MANAGED_PROJECT_OFFLINE) {
-                next->lifecycle = CBM_MANAGED_PROJECT_OFFLINE;
+            if (requested_availability == CBM_MANAGED_AVAILABILITY_OFFLINE) {
+                next->availability = CBM_MANAGED_AVAILABILITY_OFFLINE;
                 next->watcher_registered = false;
+            } else if (next->availability == CBM_MANAGED_AVAILABILITY_OFFLINE) {
+                next->availability = next->index_revision > 0U
+                                         ? CBM_MANAGED_AVAILABILITY_READY
+                                         : CBM_MANAGED_AVAILABILITY_UNAVAILABLE;
             }
             (void)managed_append_change(result, change_capacity, CBM_MANAGED_PROJECT_RETAINED,
                                         next);
@@ -390,7 +464,7 @@ bool cbm_managed_project_registry_authorize(cbm_managed_project_registry_t *regi
     /* Whether both the id and root match.
      * id 与根路径是否同时匹配。 */
     bool authorized = index != SIZE_MAX &&
-                      registry->projects[index].lifecycle != CBM_MANAGED_PROJECT_OFFLINE &&
+                      registry->projects[index].availability != CBM_MANAGED_AVAILABILITY_OFFLINE &&
                       strcmp(registry->projects[index].project_id, project_id) == 0;
     if (authorized) {
         *project_out = registry->projects[index];
@@ -499,70 +573,228 @@ bool cbm_managed_project_registry_set_watcher(cbm_managed_project_registry_t *re
      * 现有项目键索引。 */
     size_t index = managed_find_key_locked(registry, project_key);
     if (index != SIZE_MAX) {
-        registry->projects[index].watcher_registered = registered;
-        if (registered && (registry->projects[index].lifecycle == CBM_MANAGED_PROJECT_PENDING ||
-                           registry->projects[index].lifecycle == CBM_MANAGED_PROJECT_OFFLINE ||
-                           (registry->projects[index].lifecycle == CBM_MANAGED_PROJECT_FAILED &&
-                            strcmp(registry->projects[index].last_error_code,
-                                   "watch_registration_failed") == 0))) {
-            registry->projects[index].lifecycle = CBM_MANAGED_PROJECT_READY;
-            registry->projects[index].last_error_code[0] = '\0';
-            registry->projects[index].last_error_message[0] = '\0';
+        cbm_managed_project_entry_t *project = &registry->projects[index];
+        project->watcher_registered = registered;
+        if (registered && project->index_revision > 0U &&
+            strcmp(project->last_error_code, "watch_registration_failed") == 0) {
+            project->availability = CBM_MANAGED_AVAILABILITY_READY;
+            managed_clear_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                                      project->last_error_message,
+                                      sizeof(project->last_error_message));
         }
     }
     cbm_mutex_unlock(&registry->mutex);
     return index != SIZE_MAX;
 }
 
-bool cbm_managed_project_registry_mark_indexing(cbm_managed_project_registry_t *registry,
-                                                const char *project_key) {
+cbm_managed_job_begin_status_t cbm_managed_project_registry_begin_job(
+    cbm_managed_project_registry_t *registry, const char *project_key, cbm_managed_job_mode_t mode,
+    cbm_managed_job_trigger_t trigger, uint64_t started_at_ms,
+    cbm_managed_job_snapshot_t *job_out) {
+    if (!registry || !project_key || !job_out ||
+        (mode != CBM_MANAGED_JOB_MODE_UPDATE && mode != CBM_MANAGED_JOB_MODE_REBUILD)) {
+        return CBM_MANAGED_JOB_BEGIN_NOT_FOUND;
+    }
+    memset(job_out, 0, sizeof(*job_out));
+    cbm_mutex_lock(&registry->mutex);
+    size_t index = managed_find_key_locked(registry, project_key);
+    if (index == SIZE_MAX) {
+        cbm_mutex_unlock(&registry->mutex);
+        return CBM_MANAGED_JOB_BEGIN_NOT_FOUND;
+    }
+    cbm_managed_project_entry_t *project = &registry->projects[index];
+    if (project->has_active_job) {
+        *job_out = project->active_job;
+        if (project->active_job.mode == mode) {
+            job_out->coalesced = true;
+            cbm_mutex_unlock(&registry->mutex);
+            return CBM_MANAGED_JOB_BEGIN_COALESCED;
+        }
+        cbm_mutex_unlock(&registry->mutex);
+        return CBM_MANAGED_JOB_BEGIN_CONFLICT;
+    }
+    cbm_managed_job_snapshot_t job;
+    memset(&job, 0, sizeof(job));
+    job.runtime_id = registry->runtime_id;
+    job.job_id = registry->next_job_id++;
+    if (registry->next_job_id == 0U) {
+        registry->next_job_id = 1U;
+    }
+    job.job_generation = project->next_job_generation++;
+    if (project->next_job_generation == 0U) {
+        project->next_job_generation = 1U;
+    }
+    job.mode = mode;
+    job.trigger = trigger;
+    job.state = CBM_MANAGED_JOB_STATE_QUEUED;
+    job.phase = CBM_MANAGED_JOB_PHASE_QUEUED;
+    job.started_at_ms = started_at_ms;
+    job.updated_at_ms = started_at_ms;
+    project->has_active_job = true;
+    project->active_job = job;
+    managed_clear_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                              project->last_error_message, sizeof(project->last_error_message));
+    *job_out = job;
+    cbm_mutex_unlock(&registry->mutex);
+    return CBM_MANAGED_JOB_BEGIN_STARTED;
+}
+
+bool cbm_managed_project_registry_mark_job_running(cbm_managed_project_registry_t *registry,
+                                                   const char *project_key, uint64_t runtime_id,
+                                                   uint64_t job_id, uint64_t updated_at_ms) {
     if (!registry || !project_key) {
         return false;
     }
     cbm_mutex_lock(&registry->mutex);
-    /* Existing project-key index.
-     * 现有项目键索引。 */
+    size_t index = managed_find_key_locked(registry, project_key);
+    bool matched = index != SIZE_MAX && registry->projects[index].has_active_job &&
+                   registry->projects[index].active_job.runtime_id == runtime_id &&
+                   registry->projects[index].active_job.job_id == job_id;
+    if (matched) {
+        cbm_managed_job_snapshot_t *job = &registry->projects[index].active_job;
+        job->state = CBM_MANAGED_JOB_STATE_RUNNING;
+        job->updated_at_ms = updated_at_ms;
+    }
+    cbm_mutex_unlock(&registry->mutex);
+    return matched;
+}
+
+bool cbm_managed_project_registry_update_job_progress(
+    cbm_managed_project_registry_t *registry, const char *project_key, uint64_t runtime_id,
+    uint64_t job_id, cbm_managed_job_phase_t phase, uint64_t completed_units, uint64_t total_units,
+    bool has_total_units, const char *unit, uint64_t updated_at_ms) {
+    if (!registry || !project_key || phase < CBM_MANAGED_JOB_PHASE_QUEUED ||
+        phase > CBM_MANAGED_JOB_PHASE_FINALIZING) {
+        return false;
+    }
+    cbm_mutex_lock(&registry->mutex);
+    size_t index = managed_find_key_locked(registry, project_key);
+    bool matched = index != SIZE_MAX && registry->projects[index].has_active_job &&
+                   registry->projects[index].active_job.runtime_id == runtime_id &&
+                   registry->projects[index].active_job.job_id == job_id;
+    if (matched) {
+        cbm_managed_job_snapshot_t *job = &registry->projects[index].active_job;
+        cbm_managed_job_phase_t prior_phase = job->phase;
+        if (phase >= prior_phase) {
+            job->phase = phase;
+            if (phase > prior_phase || completed_units >= job->completed_units) {
+                job->completed_units = completed_units;
+            }
+            job->has_total_units = has_total_units;
+            job->total_units = has_total_units ? total_units : 0U;
+            if (unit && unit[0]) {
+                (void)snprintf(job->unit, sizeof(job->unit), "%s", unit);
+            } else {
+                job->unit[0] = '\0';
+            }
+        }
+        job->updated_at_ms = updated_at_ms;
+    }
+    cbm_mutex_unlock(&registry->mutex);
+    return matched;
+}
+
+bool cbm_managed_project_registry_restore_snapshot(cbm_managed_project_registry_t *registry,
+                                                   const char *project_key,
+                                                   uint64_t observed_at_ms) {
+    if (!registry || !project_key) {
+        return false;
+    }
+    cbm_mutex_lock(&registry->mutex);
     size_t index = managed_find_key_locked(registry, project_key);
     if (index != SIZE_MAX) {
-        registry->projects[index].lifecycle = CBM_MANAGED_PROJECT_INDEXING;
-        registry->projects[index].last_error_code[0] = '\0';
-        registry->projects[index].last_error_message[0] = '\0';
+        cbm_managed_project_entry_t *project = &registry->projects[index];
+        project->availability = CBM_MANAGED_AVAILABILITY_READY;
+        if (project->index_revision == 0U) {
+            project->index_revision = 1U;
+        }
+        if (project->last_success_at_ms == 0U) {
+            project->last_success_at_ms = observed_at_ms;
+        }
+        managed_clear_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                                  project->last_error_message, sizeof(project->last_error_message));
     }
     cbm_mutex_unlock(&registry->mutex);
     return index != SIZE_MAX;
 }
 
-bool cbm_managed_project_registry_publish_index(cbm_managed_project_registry_t *registry,
-                                                const char *project_key, bool successful,
-                                                uint64_t completed_at_ms, const char *error_code,
+bool cbm_managed_project_registry_publish_job(cbm_managed_project_registry_t *registry,
+                                              const char *project_key, uint64_t runtime_id,
+                                              uint64_t job_id,
+                                              cbm_managed_job_state_t terminal_state,
+                                              uint64_t completed_at_ms, const char *error_code,
+                                              const char *error_message) {
+    if (!registry || !project_key || !managed_job_state_is_terminal(terminal_state)) {
+        return false;
+    }
+    cbm_mutex_lock(&registry->mutex);
+    size_t index = managed_find_key_locked(registry, project_key);
+    bool matched = index != SIZE_MAX && registry->projects[index].has_active_job &&
+                   registry->projects[index].active_job.runtime_id == runtime_id &&
+                   registry->projects[index].active_job.job_id == job_id;
+    if (matched) {
+        cbm_managed_project_entry_t *project = &registry->projects[index];
+        cbm_managed_job_snapshot_t job = project->active_job;
+        job.state = terminal_state;
+        job.phase = CBM_MANAGED_JOB_PHASE_FINALIZING;
+        job.updated_at_ms = completed_at_ms;
+        job.completed_at_ms = completed_at_ms;
+        if (terminal_state == CBM_MANAGED_JOB_STATE_SUCCEEDED) {
+            project->availability = CBM_MANAGED_AVAILABILITY_READY;
+            project->index_revision++;
+            project->last_success_at_ms = completed_at_ms;
+            managed_clear_diagnostics(job.error_code, sizeof(job.error_code), job.error_message,
+                                      sizeof(job.error_message));
+            managed_clear_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                                      project->last_error_message,
+                                      sizeof(project->last_error_message));
+        } else {
+            project->availability = project->index_revision > 0U
+                                        ? CBM_MANAGED_AVAILABILITY_DEGRADED
+                                        : CBM_MANAGED_AVAILABILITY_UNAVAILABLE;
+            managed_set_diagnostics(job.error_code, sizeof(job.error_code), job.error_message,
+                                    sizeof(job.error_message), error_code, error_message);
+            managed_set_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                                    project->last_error_message,
+                                    sizeof(project->last_error_message), error_code, error_message);
+        }
+        project->last_job = job;
+        project->has_last_job = true;
+        memset(&project->active_job, 0, sizeof(project->active_job));
+        project->has_active_job = false;
+    }
+    cbm_mutex_unlock(&registry->mutex);
+    return matched;
+}
+
+bool cbm_managed_project_registry_mark_degraded(cbm_managed_project_registry_t *registry,
+                                                const char *project_key, const char *error_code,
                                                 const char *error_message) {
     if (!registry || !project_key) {
         return false;
     }
     cbm_mutex_lock(&registry->mutex);
-    /* Existing project-key index.
-     * 现有项目键索引。 */
     size_t index = managed_find_key_locked(registry, project_key);
-    if (index != SIZE_MAX) {
-        /* Mutable project state.
-         * 可变项目状态。 */
+    bool marked = index != SIZE_MAX && registry->projects[index].index_revision > 0U;
+    if (marked) {
         cbm_managed_project_entry_t *project = &registry->projects[index];
-        if (successful) {
-            project->lifecycle = CBM_MANAGED_PROJECT_READY;
-            project->index_revision++;
-            project->last_success_at_ms = completed_at_ms;
-            project->last_error_code[0] = '\0';
-            project->last_error_message[0] = '\0';
-        } else {
-            project->lifecycle = CBM_MANAGED_PROJECT_FAILED;
-            (void)snprintf(project->last_error_code, sizeof(project->last_error_code), "%s",
-                           error_code ? error_code : "index_failed");
-            (void)snprintf(project->last_error_message, sizeof(project->last_error_message), "%s",
-                           error_message ? error_message : "Managed index failed");
-        }
+        project->availability = CBM_MANAGED_AVAILABILITY_DEGRADED;
+        managed_set_diagnostics(project->last_error_code, sizeof(project->last_error_code),
+                                project->last_error_message, sizeof(project->last_error_message),
+                                error_code, error_message);
     }
     cbm_mutex_unlock(&registry->mutex);
-    return index != SIZE_MAX;
+    return marked;
+}
+
+uint64_t cbm_managed_project_registry_runtime_id(cbm_managed_project_registry_t *registry) {
+    if (!registry) {
+        return 0U;
+    }
+    cbm_mutex_lock(&registry->mutex);
+    uint64_t runtime_id = registry->runtime_id;
+    cbm_mutex_unlock(&registry->mutex);
+    return runtime_id;
 }
 
 bool cbm_managed_project_registry_mark_offline(cbm_managed_project_registry_t *registry,
@@ -575,8 +807,23 @@ bool cbm_managed_project_registry_mark_offline(cbm_managed_project_registry_t *r
      * 现有项目键索引。 */
     size_t index = managed_find_key_locked(registry, project_key);
     if (index != SIZE_MAX) {
-        registry->projects[index].lifecycle = CBM_MANAGED_PROJECT_OFFLINE;
-        registry->projects[index].watcher_registered = false;
+        cbm_managed_project_entry_t *project = &registry->projects[index];
+        project->availability = CBM_MANAGED_AVAILABILITY_OFFLINE;
+        project->watcher_registered = false;
+        if (project->has_active_job) {
+            cbm_managed_job_snapshot_t job = project->active_job;
+            job.state = CBM_MANAGED_JOB_STATE_CANCELLED;
+            job.phase = CBM_MANAGED_JOB_PHASE_FINALIZING;
+            job.updated_at_ms = cbm_now_ms();
+            job.completed_at_ms = job.updated_at_ms;
+            managed_set_diagnostics(job.error_code, sizeof(job.error_code), job.error_message,
+                                    sizeof(job.error_message), "project_offline",
+                                    "Managed project became unavailable");
+            project->last_job = job;
+            project->has_last_job = true;
+            project->has_active_job = false;
+            memset(&project->active_job, 0, sizeof(project->active_job));
+        }
     }
     cbm_mutex_unlock(&registry->mutex);
     return index != SIZE_MAX;

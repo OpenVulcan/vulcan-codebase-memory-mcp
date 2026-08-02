@@ -11,11 +11,11 @@
 
 /* Private host contract accepted by the managed service.
  * 托管服务接受的宿主私有协议。 */
-#define CBM_VULCAN_MANAGED_CONTRACT "vulcan.codebase-memory/1"
+#define CBM_VULCAN_MANAGED_CONTRACT "vulcan.codebase-memory/2"
 
 /* Private coordination ABI reported during MCP initialization.
  * MCP 初始化期间返回的私有协调 ABI。 */
-#define CBM_VULCAN_COORDINATION_ABI 1U
+#define CBM_VULCAN_COORDINATION_ABI 2U
 
 /* Fixed diagnostic field capacities keep registry snapshots self-contained.
  * 固定诊断字段容量使注册表快照保持自包含。 */
@@ -24,16 +24,114 @@
 #define CBM_MANAGED_PROJECT_KEY_CAP 4096U
 #define CBM_MANAGED_ERROR_CODE_CAP 64U
 #define CBM_MANAGED_ERROR_MESSAGE_CAP 512U
+#define CBM_MANAGED_JOB_UNIT_CAP 32U
 
-/* Managed project lifecycle visible to the Vulcan controller.
- * Vulcan 控制器可见的托管项目生命周期。 */
+/* Published index availability independent from background job activity.
+ * 与后台任务活动相互独立的已发布索引可用性。 */
 typedef enum {
-    CBM_MANAGED_PROJECT_PENDING = 0,
-    CBM_MANAGED_PROJECT_INDEXING,
-    CBM_MANAGED_PROJECT_READY,
-    CBM_MANAGED_PROJECT_OFFLINE,
-    CBM_MANAGED_PROJECT_FAILED,
-} cbm_managed_project_lifecycle_t;
+    CBM_MANAGED_AVAILABILITY_UNAVAILABLE = 0,
+    CBM_MANAGED_AVAILABILITY_READY,
+    CBM_MANAGED_AVAILABILITY_DEGRADED,
+    CBM_MANAGED_AVAILABILITY_OFFLINE,
+} cbm_managed_availability_t;
+
+/* Managed index operation mode selected by the controller.
+ * 控制器选择的托管索引操作模式。 */
+typedef enum {
+    CBM_MANAGED_JOB_MODE_UPDATE = 1,
+    CBM_MANAGED_JOB_MODE_REBUILD,
+} cbm_managed_job_mode_t;
+
+/* Source that requested one managed index operation.
+ * 请求一次托管索引操作的来源。 */
+typedef enum {
+    CBM_MANAGED_JOB_TRIGGER_INITIAL = 1,
+    CBM_MANAGED_JOB_TRIGGER_WATCHER,
+    CBM_MANAGED_JOB_TRIGGER_MANUAL,
+    CBM_MANAGED_JOB_TRIGGER_RECOVERY,
+} cbm_managed_job_trigger_t;
+
+/* Managed index job state with explicit terminal values.
+ * 具有显式终态的托管索引任务状态。 */
+typedef enum {
+    CBM_MANAGED_JOB_STATE_NONE = 0,
+    CBM_MANAGED_JOB_STATE_QUEUED,
+    CBM_MANAGED_JOB_STATE_RUNNING,
+    CBM_MANAGED_JOB_STATE_SUCCEEDED,
+    CBM_MANAGED_JOB_STATE_FAILED,
+    CBM_MANAGED_JOB_STATE_CANCELLED,
+} cbm_managed_job_state_t;
+
+/* Stable user-facing indexing phase.
+ * 稳定的用户可见索引阶段。 */
+typedef enum {
+    CBM_MANAGED_JOB_PHASE_QUEUED = 1,
+    CBM_MANAGED_JOB_PHASE_DISCOVERING,
+    CBM_MANAGED_JOB_PHASE_EXTRACTING,
+    CBM_MANAGED_JOB_PHASE_RESOLVING,
+    CBM_MANAGED_JOB_PHASE_PERSISTING,
+    CBM_MANAGED_JOB_PHASE_PUBLISHING,
+    CBM_MANAGED_JOB_PHASE_FINALIZING,
+} cbm_managed_job_phase_t;
+
+/* One copied job snapshot safe across registry mutations.
+ * 一个在注册表变更后仍安全的任务快照。 */
+typedef struct {
+    /* Process runtime generation that owns the job.
+     * 拥有该任务的进程运行代次。 */
+    uint64_t runtime_id;
+    /* Runtime-unique job identifier.
+     * 运行时唯一任务标识。 */
+    uint64_t job_id;
+    /* Monotonic per-project job generation.
+     * 项目内单调递增的任务代次。 */
+    uint64_t job_generation;
+    /* Requested operation mode.
+     * 请求的操作模式。 */
+    cbm_managed_job_mode_t mode;
+    /* Request source.
+     * 请求来源。 */
+    cbm_managed_job_trigger_t trigger;
+    /* Current or terminal state.
+     * 当前或终态状态。 */
+    cbm_managed_job_state_t state;
+    /* Current stable phase.
+     * 当前稳定阶段。 */
+    cbm_managed_job_phase_t phase;
+    /* Completed progress units.
+     * 已完成的进度单位数。 */
+    uint64_t completed_units;
+    /* Total progress units, meaningful only when has_total_units is true.
+     * 进度单位总数，仅在 has_total_units 为真时有意义。 */
+    uint64_t total_units;
+    /* Whether a stable progress denominator is known.
+     * 是否已知稳定的进度分母。 */
+    bool has_total_units;
+    /* Bounded progress unit label such as files.
+     * 有界的进度单位标签，例如 files。 */
+    char unit[CBM_MANAGED_JOB_UNIT_CAP];
+    /* Job timestamps in Unix milliseconds.
+     * 任务的 Unix 毫秒时间戳。 */
+    uint64_t started_at_ms;
+    uint64_t updated_at_ms;
+    uint64_t completed_at_ms;
+    /* Whether this response reused an existing same-mode job.
+     * 本次响应是否复用了现有同模式任务。 */
+    bool coalesced;
+    /* Stable terminal error diagnostics.
+     * 稳定的终态错误诊断。 */
+    char error_code[CBM_MANAGED_ERROR_CODE_CAP];
+    char error_message[CBM_MANAGED_ERROR_MESSAGE_CAP];
+} cbm_managed_job_snapshot_t;
+
+/* Result of beginning one managed job.
+ * 开始一次托管任务的结果。 */
+typedef enum {
+    CBM_MANAGED_JOB_BEGIN_STARTED = 1,
+    CBM_MANAGED_JOB_BEGIN_COALESCED,
+    CBM_MANAGED_JOB_BEGIN_CONFLICT,
+    CBM_MANAGED_JOB_BEGIN_NOT_FOUND,
+} cbm_managed_job_begin_status_t;
 
 /* One immutable-by-caller registry snapshot entry.
  * 一个调用方不可变的注册表快照条目。 */
@@ -47,9 +145,9 @@ typedef struct {
     /* CBM storage project key derived from the canonical root.
      * 从规范化根路径派生的 CBM 存储项目键。 */
     char project_key[CBM_MANAGED_PROJECT_KEY_CAP];
-    /* Current lifecycle state.
-     * 当前生命周期状态。 */
-    cbm_managed_project_lifecycle_t lifecycle;
+    /* Published index availability.
+     * 已发布索引可用性。 */
+    cbm_managed_availability_t availability;
     /* True only while the shared physical watcher is registered.
      * 仅当共享物理 watcher 已注册时为真。 */
     bool watcher_registered;
@@ -59,6 +157,17 @@ typedef struct {
     /* Last successful index timestamp in Unix milliseconds.
      * 最近一次索引成功的 Unix 毫秒时间戳。 */
     uint64_t last_success_at_ms;
+    /* Active non-terminal job, if present.
+     * 当前活动的非终态任务（若存在）。 */
+    bool has_active_job;
+    cbm_managed_job_snapshot_t active_job;
+    /* Most recent terminal job, if present.
+     * 最近一次终态任务（若存在）。 */
+    bool has_last_job;
+    cbm_managed_job_snapshot_t last_job;
+    /* Monotonic job generation retained across authoritative syncs.
+     * 在权威同步间保留的单调任务代次。 */
+    uint64_t next_job_generation;
     /* Stable machine-readable error code.
      * 稳定的机器可读错误码。 */
     char last_error_code[CBM_MANAGED_ERROR_CODE_CAP];
@@ -302,8 +411,28 @@ bool cbm_managed_project_registry_set_watcher(cbm_managed_project_registry_t *re
  * Returns false when the project was removed concurrently.
  * 项目被并发移除时返回 false。
  */
-bool cbm_managed_project_registry_mark_indexing(cbm_managed_project_registry_t *registry,
-                                                const char *project_key);
+cbm_managed_job_begin_status_t cbm_managed_project_registry_begin_job(
+    cbm_managed_project_registry_t *registry, const char *project_key, cbm_managed_job_mode_t mode,
+    cbm_managed_job_trigger_t trigger, uint64_t started_at_ms, cbm_managed_job_snapshot_t *job_out);
+
+/* Mark the exact active job as running.
+ * 将精确匹配的活动任务标记为运行中。 */
+bool cbm_managed_project_registry_mark_job_running(cbm_managed_project_registry_t *registry,
+                                                   const char *project_key, uint64_t runtime_id,
+                                                   uint64_t job_id, uint64_t updated_at_ms);
+
+/* Advance progress for the exact active job without allowing phase regression.
+ * 推进精确活动任务的进度，同时禁止阶段倒退。 */
+bool cbm_managed_project_registry_update_job_progress(
+    cbm_managed_project_registry_t *registry, const char *project_key, uint64_t runtime_id,
+    uint64_t job_id, cbm_managed_job_phase_t phase, uint64_t completed_units, uint64_t total_units,
+    bool has_total_units, const char *unit, uint64_t updated_at_ms);
+
+/* Restore an already-published database discovered during project sync.
+ * 恢复项目同步期间发现的已发布数据库事实。 */
+bool cbm_managed_project_registry_restore_snapshot(cbm_managed_project_registry_t *registry,
+                                                   const char *project_key,
+                                                   uint64_t observed_at_ms);
 
 /* Publish a managed index terminal result and advance revision on success.
  * 发布托管索引终态，并在成功时推进修订号。
@@ -326,10 +455,36 @@ bool cbm_managed_project_registry_mark_indexing(cbm_managed_project_registry_t *
  * Returns false when the project was removed concurrently.
  * 项目被并发移除时返回 false。
  */
-bool cbm_managed_project_registry_publish_index(cbm_managed_project_registry_t *registry,
-                                                const char *project_key, bool successful,
-                                                uint64_t completed_at_ms, const char *error_code,
+bool cbm_managed_project_registry_publish_job(cbm_managed_project_registry_t *registry,
+                                              const char *project_key, uint64_t runtime_id,
+                                              uint64_t job_id,
+                                              cbm_managed_job_state_t terminal_state,
+                                              uint64_t completed_at_ms, const char *error_code,
+                                              const char *error_message);
+
+/* Mark a published project degraded because a post-publication service failed.
+ * 因发布后的服务失败而将已发布项目标记为降级。
+ *
+ * Parameters:
+ * - registry: daemon-owned registry.
+ * - project_key: exact registered storage key.
+ * - error_code: stable bounded diagnostic code.
+ * - error_message: bounded human-readable diagnostic message.
+ * Returns false when the project is absent or has no published revision.
+ *
+ * 参数：
+ * - registry：daemon 拥有的注册表。
+ * - project_key：精确注册的存储键。
+ * - error_code：稳定且有界的诊断代码。
+ * - error_message：有界的人类可读诊断消息。
+ * 项目不存在或尚无已发布修订时返回 false。 */
+bool cbm_managed_project_registry_mark_degraded(cbm_managed_project_registry_t *registry,
+                                                const char *project_key, const char *error_code,
                                                 const char *error_message);
+
+/* Return this Sidecar process runtime generation.
+ * 返回当前 Sidecar 进程运行代次。 */
+uint64_t cbm_managed_project_registry_runtime_id(cbm_managed_project_registry_t *registry);
 
 /* Mark a registered root offline without deleting its state or storage.
  * 将已注册根路径标记为离线，但不删除其状态或存储。

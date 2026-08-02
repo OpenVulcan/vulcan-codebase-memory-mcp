@@ -5047,7 +5047,7 @@ TEST(daemon_application_explicit_permanent_managed_watchers_outlive_sessions) {
                                           &response, &response_length)
                        : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
     bool missing_root_retained =
-        response && strstr((const char *)response, "\\\"lifecycle\\\":\\\"offline\\\"") &&
+        response && strstr((const char *)response, "\\\"availability\\\":\\\"offline\\\"") &&
         cbm_watcher_watch_count(watcher) == 3 && cbm_file_exists(database_paths[0]);
     free(response);
     response = NULL;
@@ -5115,12 +5115,13 @@ TEST(daemon_application_explicit_permanent_managed_watchers_outlive_sessions) {
     char reindex_arguments[8192];
     bool reindex_encoded =
         snprintf(reindex_arguments, sizeof(reindex_arguments),
-                 "{\"contract\":\"%s\",\"project_id\":\"project-2\",\"pwd\":\"%s\"}",
+                 "{\"contract\":\"%s\",\"project_id\":\"project-2\",\"pwd\":\"%s\","
+                 "\"mode\":\"rebuild\"}",
                  CBM_VULCAN_MANAGED_CONTRACT, canonical[1]) < (int)sizeof(reindex_arguments);
     uint8_t *reindex_request = NULL;
     uint32_t reindex_request_length = 0;
     reindex_encoded =
-        reindex_encoded && app_test_tool_request("vulcan_reindex_project", reindex_arguments,
+        reindex_encoded && app_test_tool_request("vulcan_update_project_index", reindex_arguments,
                                                  &reindex_request, &reindex_request_length);
     cbm_daemon_runtime_application_status_t reindex_status =
         reindex_encoded ? app_test_request(&callbacks, replacement, reindex_request,
@@ -5159,9 +5160,9 @@ TEST(daemon_application_explicit_permanent_managed_watchers_outlive_sessions) {
             ? app_test_request(&callbacks, replacement, job_status_request,
                                job_status_request_length, &response, &response_length)
             : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
-    bool completed_offline = response &&
-                             strstr((const char *)response, "\\\"lifecycle\\\":\\\"offline\\\"") &&
-                             strstr((const char *)response, "\\\"index_revision\\\":1");
+    bool completed_offline =
+        response && strstr((const char *)response, "\\\"availability\\\":\\\"offline\\\"") &&
+        strstr((const char *)response, "\\\"revision\\\":2");
     free(response);
     response = NULL;
 

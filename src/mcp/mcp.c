@@ -674,7 +674,7 @@ static const tool_def_t TOOLS[] = {
      "The generation must increase strictly. Removed projects are unwatched "
      "without deleting databases or graph artifacts.",
      "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
-     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\","
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/2\","
      "\"description\":\"Private Vulcan managed-service contract.\"},"
      "\"generation\":{\"type\":\"integer\",\"minimum\":1,"
      "\"description\":\"Strictly increasing authoritative generation.\"},"
@@ -688,22 +688,23 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"contract\",\"generation\",\"projects\"]}"},
 
     {"vulcan_project_status", "Read Vulcan project status",
-     "Return lifecycle, watcher, index revision, graph counts, and the latest "
-     "bounded error for one registered Vulcan project.",
+     "Return published availability, watcher state, index revision, graph counts, "
+     "active job, latest terminal job, and bounded diagnostics for one registered project.",
      "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
-     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\"},"
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/2\"},"
      "\"project_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":255},"
      "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095}},"
      "\"required\":[\"contract\",\"project_id\",\"pwd\"]}"},
 
-    {"vulcan_reindex_project", "Reindex Vulcan project",
-     "Schedule a full index for one registered Vulcan project. An existing "
-     "physical job is returned instead of starting a duplicate.",
+    {"vulcan_update_project_index", "Update Vulcan project index",
+     "Schedule an explicit incremental update or isolated full rebuild for one registered "
+     "Vulcan project. Same-mode requests coalesce; a different active mode conflicts.",
      "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
-     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/1\"},"
+     "\"contract\":{\"type\":\"string\",\"const\":\"vulcan.codebase-memory/2\"},"
      "\"project_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":255},"
-     "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095}},"
-     "\"required\":[\"contract\",\"project_id\",\"pwd\"]}"},
+     "\"pwd\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4095},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"update\",\"rebuild\"]}},"
+     "\"required\":[\"contract\",\"project_id\",\"pwd\",\"mode\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -738,7 +739,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"ingest_traces", false, false, false, false},
     {"vulcan_sync_projects", false, false, false, false},
     {"vulcan_project_status", true, false, true, false},
-    {"vulcan_reindex_project", false, false, true, false},
+    {"vulcan_update_project_index", false, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -852,7 +853,7 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "detect_changes",
         "vulcan_sync_projects",
         "vulcan_project_status",
-        "vulcan_reindex_project",
+        "vulcan_update_project_index",
     };
     if (!name) {
         return false;
@@ -8128,6 +8129,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(mode_str);
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
+    /* Controller-only rebuild selection copied into the contained worker request.
+     * 复制到受控 worker 请求中的控制器专用重建选择。 */
+    bool force_rebuild = cbm_mcp_get_bool_arg(args, "_vulcan_force_rebuild");
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
@@ -8147,6 +8151,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+    cbm_pipeline_set_force_rebuild(p, force_rebuild);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -10915,7 +10920,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 static bool managed_control_tool(const char *tool_name) {
     return tool_name && (strcmp(tool_name, "vulcan_sync_projects") == 0 ||
                          strcmp(tool_name, "vulcan_project_status") == 0 ||
-                         strcmp(tool_name, "vulcan_reindex_project") == 0);
+                         strcmp(tool_name, "vulcan_update_project_index") == 0);
 }
 
 /*
@@ -11148,20 +11153,18 @@ static char *managed_authorized_arguments(cbm_mcp_server_t *srv, const char *arg
  * Return a textual managed lifecycle name.
  * 返回托管生命周期的文本名称。
  */
-static const char *managed_lifecycle_name(cbm_managed_project_lifecycle_t lifecycle) {
-    switch (lifecycle) {
-    case CBM_MANAGED_PROJECT_PENDING:
-        return "pending";
-    case CBM_MANAGED_PROJECT_INDEXING:
-        return "indexing";
-    case CBM_MANAGED_PROJECT_READY:
+static const char *managed_availability_name(cbm_managed_availability_t availability) {
+    switch (availability) {
+    case CBM_MANAGED_AVAILABILITY_UNAVAILABLE:
+        return "unavailable";
+    case CBM_MANAGED_AVAILABILITY_READY:
         return "ready";
-    case CBM_MANAGED_PROJECT_OFFLINE:
+    case CBM_MANAGED_AVAILABILITY_DEGRADED:
+        return "degraded";
+    case CBM_MANAGED_AVAILABILITY_OFFLINE:
         return "offline";
-    case CBM_MANAGED_PROJECT_FAILED:
-        return "failed";
     }
-    return "unknown";
+    return "unavailable";
 }
 
 /*
@@ -11169,20 +11172,101 @@ static const char *managed_lifecycle_name(cbm_managed_project_lifecycle_t lifecy
  *
  * 返回一个托管生命周期对应的控制器侧索引状态。
  */
-static const char *managed_index_status_name(cbm_managed_project_lifecycle_t lifecycle) {
-    switch (lifecycle) {
-    case CBM_MANAGED_PROJECT_PENDING:
-        return "pending";
-    case CBM_MANAGED_PROJECT_INDEXING:
-        return "running";
-    case CBM_MANAGED_PROJECT_READY:
-        return "idle";
-    case CBM_MANAGED_PROJECT_OFFLINE:
-        return "paused";
-    case CBM_MANAGED_PROJECT_FAILED:
-        return "failed";
+static const char *managed_job_mode_name(cbm_managed_job_mode_t mode) {
+    return mode == CBM_MANAGED_JOB_MODE_REBUILD ? "rebuild" : "update";
+}
+
+/* Return the controller-facing source name for one managed job.
+ * 返回一个托管任务面向控制器的来源名称。 */
+static const char *managed_job_trigger_name(cbm_managed_job_trigger_t trigger) {
+    switch (trigger) {
+    case CBM_MANAGED_JOB_TRIGGER_INITIAL:
+        return "initial";
+    case CBM_MANAGED_JOB_TRIGGER_WATCHER:
+        return "watcher";
+    case CBM_MANAGED_JOB_TRIGGER_MANUAL:
+        return "manual";
+    case CBM_MANAGED_JOB_TRIGGER_RECOVERY:
+        return "recovery";
     }
-    return "unknown";
+    return "manual";
+}
+
+/* Return the controller-facing state name for one managed job.
+ * 返回一个托管任务面向控制器的状态名称。 */
+static const char *managed_job_state_name(cbm_managed_job_state_t state) {
+    switch (state) {
+    case CBM_MANAGED_JOB_STATE_NONE:
+        return "none";
+    case CBM_MANAGED_JOB_STATE_QUEUED:
+        return "queued";
+    case CBM_MANAGED_JOB_STATE_RUNNING:
+        return "running";
+    case CBM_MANAGED_JOB_STATE_SUCCEEDED:
+        return "succeeded";
+    case CBM_MANAGED_JOB_STATE_FAILED:
+        return "failed";
+    case CBM_MANAGED_JOB_STATE_CANCELLED:
+        return "cancelled";
+    }
+    return "none";
+}
+
+/* Return the controller-facing phase name for one managed job.
+ * 返回一个托管任务面向控制器的阶段名称。 */
+static const char *managed_job_phase_name(cbm_managed_job_phase_t phase) {
+    switch (phase) {
+    case CBM_MANAGED_JOB_PHASE_QUEUED:
+        return "queued";
+    case CBM_MANAGED_JOB_PHASE_DISCOVERING:
+        return "discovering";
+    case CBM_MANAGED_JOB_PHASE_EXTRACTING:
+        return "extracting";
+    case CBM_MANAGED_JOB_PHASE_RESOLVING:
+        return "resolving";
+    case CBM_MANAGED_JOB_PHASE_PERSISTING:
+        return "persisting";
+    case CBM_MANAGED_JOB_PHASE_PUBLISHING:
+        return "publishing";
+    case CBM_MANAGED_JOB_PHASE_FINALIZING:
+        return "finalizing";
+    }
+    return "queued";
+}
+
+/* Build one immutable job snapshot object owned by the response document.
+ * 构建一个由响应文档持有的不可变任务快照对象。 */
+static yyjson_mut_val *managed_job_snapshot_json(yyjson_mut_doc *doc,
+                                                 const cbm_managed_job_snapshot_t *job) {
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, object, "runtime_id", job->runtime_id);
+    yyjson_mut_obj_add_uint(doc, object, "job_id", job->job_id);
+    yyjson_mut_obj_add_uint(doc, object, "job_generation", job->job_generation);
+    yyjson_mut_obj_add_str(doc, object, "mode", managed_job_mode_name(job->mode));
+    yyjson_mut_obj_add_str(doc, object, "trigger", managed_job_trigger_name(job->trigger));
+    yyjson_mut_obj_add_str(doc, object, "state", managed_job_state_name(job->state));
+    yyjson_mut_obj_add_str(doc, object, "phase", managed_job_phase_name(job->phase));
+    yyjson_mut_obj_add_uint(doc, object, "completed_units", job->completed_units);
+    if (job->has_total_units) {
+        yyjson_mut_obj_add_uint(doc, object, "total_units", job->total_units);
+    } else {
+        yyjson_mut_obj_add_null(doc, object, "total_units");
+    }
+    yyjson_mut_obj_add_bool(doc, object, "has_total_units", job->has_total_units);
+    yyjson_mut_obj_add_str(doc, object, "unit", job->unit);
+    yyjson_mut_obj_add_uint(doc, object, "started_at_ms", job->started_at_ms);
+    yyjson_mut_obj_add_uint(doc, object, "updated_at_ms", job->updated_at_ms);
+    yyjson_mut_obj_add_uint(doc, object, "completed_at_ms", job->completed_at_ms);
+    yyjson_mut_obj_add_bool(doc, object, "coalesced", job->coalesced);
+    if (job->error_code[0] || job->error_message[0]) {
+        yyjson_mut_val *error = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, error, "code", job->error_code);
+        yyjson_mut_obj_add_strcpy(doc, error, "message", job->error_message);
+        yyjson_mut_obj_add_val(doc, object, "error", error);
+    } else {
+        yyjson_mut_obj_add_null(doc, object, "error");
+    }
+    return object;
 }
 
 /*
@@ -11201,25 +11285,30 @@ static const char *managed_index_status_name(cbm_managed_project_lifecycle_t lif
  */
 static void managed_add_project_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val *object,
                                             const cbm_managed_project_entry_t *project) {
-    yyjson_mut_obj_add_str(doc, object, "lifecycle", managed_lifecycle_name(project->lifecycle));
-    yyjson_mut_obj_add_str(doc, object, "index_status",
-                           managed_index_status_name(project->lifecycle));
+    yyjson_mut_obj_add_str(doc, object, "availability",
+                           managed_availability_name(project->availability));
     yyjson_mut_obj_add_bool(doc, object, "watcher_registered", project->watcher_registered);
-    yyjson_mut_obj_add_uint(doc, object, "index_revision", project->index_revision);
+    yyjson_mut_obj_add_uint(doc, object, "revision", project->index_revision);
     yyjson_mut_obj_add_uint(doc, object, "last_success_at_ms", project->last_success_at_ms);
-    if (project->last_error_code[0]) {
-        /*
-         * Copy registry diagnostics because callers may serialize after the
-         *
-         * project snapshot leaves its stack scope.
-         *
-         * 复制注册表诊断字符串，因为调用方可能在项目快照离开栈作用域后才序列化。
-
-         */
-        yyjson_mut_obj_add_strcpy(doc, object, "error_code", project->last_error_code);
+    if (project->has_active_job) {
+        yyjson_mut_obj_add_val(doc, object, "active_job",
+                               managed_job_snapshot_json(doc, &project->active_job));
+    } else {
+        yyjson_mut_obj_add_null(doc, object, "active_job");
     }
-    if (project->last_error_message[0]) {
-        yyjson_mut_obj_add_strcpy(doc, object, "error", project->last_error_message);
+    if (project->has_last_job) {
+        yyjson_mut_obj_add_val(doc, object, "last_job",
+                               managed_job_snapshot_json(doc, &project->last_job));
+    } else {
+        yyjson_mut_obj_add_null(doc, object, "last_job");
+    }
+    if (project->last_error_code[0] || project->last_error_message[0]) {
+        yyjson_mut_val *error = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, error, "code", project->last_error_code);
+        yyjson_mut_obj_add_strcpy(doc, error, "message", project->last_error_message);
+        yyjson_mut_obj_add_val(doc, object, "last_error", error);
+    } else {
+        yyjson_mut_obj_add_null(doc, object, "last_error");
     }
 }
 
@@ -11230,7 +11319,7 @@ static void managed_add_project_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val 
 
  */
 static bool managed_parse_control_identity(cbm_mcp_server_t *srv, const char *args_json,
-                                           bool allow_offline,
+                                           bool allow_offline, bool allow_mode,
                                            cbm_managed_project_entry_t *project_out,
                                            const char **error_out) {
     if (error_out) {
@@ -11241,6 +11330,7 @@ static bool managed_parse_control_identity(cbm_mcp_server_t *srv, const char *ar
     yyjson_val *contract = root ? yyjson_obj_get(root, "contract") : NULL;
     yyjson_val *project_id = root ? yyjson_obj_get(root, "project_id") : NULL;
     yyjson_val *pwd = root ? yyjson_obj_get(root, "pwd") : NULL;
+    yyjson_val *mode = root ? yyjson_obj_get(root, "mode") : NULL;
     if (contract && yyjson_is_str(contract) &&
         strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) != 0) {
         if (error_out) {
@@ -11249,8 +11339,9 @@ static bool managed_parse_control_identity(cbm_mcp_server_t *srv, const char *ar
         yyjson_doc_free(doc);
         return false;
     }
-    bool valid = root && yyjson_is_obj(root) && yyjson_obj_size(root) == 3U && contract &&
-                 yyjson_is_str(contract) &&
+    bool mode_shape_valid = allow_mode ? mode && yyjson_is_str(mode) : mode == NULL;
+    bool valid = root && yyjson_is_obj(root) && yyjson_obj_size(root) == (allow_mode ? 4U : 3U) &&
+                 mode_shape_valid && contract && yyjson_is_str(contract) &&
                  strcmp(yyjson_get_str(contract), CBM_VULCAN_MANAGED_CONTRACT) == 0 && project_id &&
                  yyjson_is_str(project_id) && yyjson_get_str(project_id)[0] && pwd &&
                  yyjson_is_str(pwd) && yyjson_get_str(pwd)[0];
@@ -11388,7 +11479,7 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
     if (!committed) {
         const char *code = sync.status == CBM_MANAGED_SYNC_STALE_GENERATION ? "stale_generation"
                            : sync.status == CBM_MANAGED_SYNC_CONFLICT       ? "project_conflict"
-                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY      ? "no_memory"
+                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY ? "no_memory"
                                                                        : "invalid_sync_request";
         cbm_managed_sync_result_free(&sync);
         cbm_managed_project_registry_reconcile_end(srv->managed_projects);
@@ -11413,6 +11504,8 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
         char database_path[CBM_SZ_2K];
         project_db_path(change->project.project_key, database_path, sizeof(database_path));
         if (managed_database_available(change->project.project_key, database_path)) {
+            (void)cbm_managed_project_registry_restore_snapshot(
+                srv->managed_projects, change->project.project_key, cbm_now_ms());
             bool watched = srv->managed_ops->watch_project(srv->managed_ops_context,
                                                            change->project.project_key,
                                                            change->project.canonical_root);
@@ -11424,20 +11517,17 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
                     (void)cbm_managed_project_registry_mark_offline(srv->managed_projects,
                                                                     change->project.project_key);
                 } else {
-                    (void)cbm_managed_project_registry_publish_index(
-                        srv->managed_projects, change->project.project_key, false, cbm_now_ms(),
+                    (void)cbm_managed_project_registry_mark_degraded(
+                        srv->managed_projects, change->project.project_key,
                         "watch_registration_failed", "Managed watcher registration failed");
                 }
             }
         } else {
             cbm_mcp_managed_index_status_t scheduled = srv->managed_ops->schedule_index(
                 srv->managed_ops_context, change->project.project_key,
-                change->project.canonical_root, false);
-            if (scheduled == CBM_MCP_MANAGED_INDEX_FAILED) {
-                (void)cbm_managed_project_registry_publish_index(
-                    srv->managed_projects, change->project.project_key, false, cbm_now_ms(),
-                    "index_schedule_failed", "Managed index scheduling failed");
-            }
+                change->project.canonical_root, CBM_MCP_MANAGED_INDEX_MODE_UPDATE,
+                CBM_MCP_MANAGED_INDEX_TRIGGER_INITIAL);
+            (void)scheduled;
         }
     }
 
@@ -11467,7 +11557,8 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
                                                       change->project.project_key, &current);
         yyjson_mut_val *status = yyjson_mut_obj(response_doc);
         yyjson_mut_obj_add_str(response_doc, status, "project_id", change->project.project_id);
-        bool accepted = current.lifecycle != CBM_MANAGED_PROJECT_FAILED;
+        bool accepted =
+            current.availability != CBM_MANAGED_AVAILABILITY_UNAVAILABLE || current.has_active_job;
         if (!accepted) {
             failed++;
         }
@@ -11512,7 +11603,7 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
 static char *handle_vulcan_project_status(cbm_mcp_server_t *srv, const char *args) {
     cbm_managed_project_entry_t project = {0};
     const char *error = NULL;
-    if (!managed_parse_control_identity(srv, args, true, &project, &error)) {
+    if (!managed_parse_control_identity(srv, args, true, false, &project, &error)) {
         return managed_error_result(error, "Vulcan project authorization failed");
     }
     cbm_store_t *store = resolve_store(srv, project.project_key);
@@ -11538,21 +11629,44 @@ static char *handle_vulcan_project_status(cbm_mcp_server_t *srv, const char *arg
  *
  * 调度一次已授权的全量重建索引，同时避免重复物理任务。
  */
-static char *handle_vulcan_reindex_project(cbm_mcp_server_t *srv, const char *args) {
+static char *handle_vulcan_update_project_index(cbm_mcp_server_t *srv, const char *args) {
     cbm_managed_project_entry_t project = {0};
     const char *error = NULL;
-    if (!managed_parse_control_identity(srv, args, false, &project, &error)) {
+    if (!managed_parse_control_identity(srv, args, false, true, &project, &error)) {
         return managed_error_result(error, "Vulcan project authorization failed");
     }
     if (!srv->managed_ops || !srv->managed_ops->schedule_index) {
         return managed_error_result("managed_runtime_unavailable",
                                     "Managed index scheduler is unavailable");
     }
+    yyjson_doc *request_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *request_root = request_doc ? yyjson_doc_get_root(request_doc) : NULL;
+    yyjson_val *mode_value = request_root ? yyjson_obj_get(request_root, "mode") : NULL;
+    const char *mode_text =
+        mode_value && yyjson_is_str(mode_value) ? yyjson_get_str(mode_value) : NULL;
+    cbm_mcp_managed_index_mode_t mode;
+    const char *canonical_mode = NULL;
+    if (mode_text && strcmp(mode_text, "update") == 0) {
+        mode = CBM_MCP_MANAGED_INDEX_MODE_UPDATE;
+        canonical_mode = "update";
+    } else if (mode_text && strcmp(mode_text, "rebuild") == 0) {
+        mode = CBM_MCP_MANAGED_INDEX_MODE_REBUILD;
+        canonical_mode = "rebuild";
+    } else {
+        yyjson_doc_free(request_doc);
+        return managed_error_result("invalid_mode", "Managed index mode must be update or rebuild");
+    }
+    yyjson_doc_free(request_doc);
     cbm_mcp_managed_index_status_t status = srv->managed_ops->schedule_index(
-        srv->managed_ops_context, project.project_key, project.canonical_root, true);
+        srv->managed_ops_context, project.project_key, project.canonical_root, mode,
+        CBM_MCP_MANAGED_INDEX_TRIGGER_MANUAL);
     if (status == CBM_MCP_MANAGED_INDEX_FAILED) {
         return managed_error_result("index_schedule_failed",
                                     "Unable to schedule the managed index");
+    }
+    if (status == CBM_MCP_MANAGED_INDEX_CONFLICT) {
+        return managed_error_result("index_mode_conflict",
+                                    "A different managed index mode is already active");
     }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -11560,6 +11674,7 @@ static char *handle_vulcan_reindex_project(cbm_mcp_server_t *srv, const char *ar
     yyjson_mut_obj_add_str(doc, root, "contract", CBM_VULCAN_MANAGED_CONTRACT);
     yyjson_mut_obj_add_str(doc, root, "project_id", project.project_id);
     yyjson_mut_obj_add_bool(doc, root, "accepted", true);
+    yyjson_mut_obj_add_str(doc, root, "mode", canonical_mode);
     yyjson_mut_obj_add_str(doc, root, "status",
                            status == CBM_MCP_MANAGED_INDEX_RUNNING ? "running" : "started");
     yyjson_mut_obj_add_bool(doc, root, "coalesced", status == CBM_MCP_MANAGED_INDEX_RUNNING);
@@ -11634,8 +11749,8 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     if (strcmp(tool_name, "vulcan_project_status") == 0) {
         return handle_vulcan_project_status(srv, args_json);
     }
-    if (strcmp(tool_name, "vulcan_reindex_project") == 0) {
-        return handle_vulcan_reindex_project(srv, args_json);
+    if (strcmp(tool_name, "vulcan_update_project_index") == 0) {
+        return handle_vulcan_update_project_index(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

@@ -95,20 +95,45 @@ static void mcp_managed_test_unwatch(void *context, const char *project_key) {
  *
  * 在协议夹具中应用并统计托管索引准入。
  */
-static cbm_mcp_managed_index_status_t mcp_managed_test_schedule(void *context,
-                                                                const char *project_key,
-                                                                const char *canonical_root,
-                                                                bool force) {
-    (void)force;
+static cbm_mcp_managed_index_status_t mcp_managed_test_schedule(
+    void *context, const char *project_key, const char *canonical_root,
+    cbm_mcp_managed_index_mode_t mode, cbm_mcp_managed_index_trigger_t trigger) {
     mcp_managed_test_context_t *state = context;
     if (!state || !state->registry || !project_key || !project_key[0] || !canonical_root ||
         !canonical_root[0] || state->reject_schedule) {
         return CBM_MCP_MANAGED_INDEX_FAILED;
     }
     state->schedule_calls++;
-    return cbm_managed_project_registry_mark_indexing(state->registry, project_key)
-               ? CBM_MCP_MANAGED_INDEX_RUNNING
-               : CBM_MCP_MANAGED_INDEX_FAILED;
+    /* Registry job mode corresponding to the protocol mode.
+     * 与协议模式对应的注册表任务模式。 */
+    cbm_managed_job_mode_t registry_mode = mode == CBM_MCP_MANAGED_INDEX_MODE_REBUILD
+                                               ? CBM_MANAGED_JOB_MODE_REBUILD
+                                               : CBM_MANAGED_JOB_MODE_UPDATE;
+    /* Registry trigger corresponding to the protocol trigger.
+     * 与协议触发源对应的注册表触发源。 */
+    cbm_managed_job_trigger_t registry_trigger = CBM_MANAGED_JOB_TRIGGER_MANUAL;
+    if (trigger == CBM_MCP_MANAGED_INDEX_TRIGGER_INITIAL) {
+        registry_trigger = CBM_MANAGED_JOB_TRIGGER_INITIAL;
+    } else if (trigger == CBM_MCP_MANAGED_INDEX_TRIGGER_WATCHER) {
+        registry_trigger = CBM_MANAGED_JOB_TRIGGER_WATCHER;
+    } else if (trigger == CBM_MCP_MANAGED_INDEX_TRIGGER_RECOVERY) {
+        registry_trigger = CBM_MANAGED_JOB_TRIGGER_RECOVERY;
+    }
+    /* Admitted or coalesced registry job snapshot.
+     * 已准入或已合并的注册表任务快照。 */
+    cbm_managed_job_snapshot_t job = {0};
+    cbm_managed_job_begin_status_t admitted = cbm_managed_project_registry_begin_job(
+        state->registry, project_key, registry_mode, registry_trigger, 100U, &job);
+    if (admitted == CBM_MANAGED_JOB_BEGIN_STARTED) {
+        return CBM_MCP_MANAGED_INDEX_STARTED;
+    }
+    if (admitted == CBM_MANAGED_JOB_BEGIN_COALESCED) {
+        return CBM_MCP_MANAGED_INDEX_RUNNING;
+    }
+    if (admitted == CBM_MANAGED_JOB_BEGIN_CONFLICT) {
+        return CBM_MCP_MANAGED_INDEX_CONFLICT;
+    }
+    return CBM_MCP_MANAGED_INDEX_FAILED;
 }
 
 /*
@@ -2966,12 +2991,11 @@ TEST(tool_trace_call_path_prefers_definition) {
 TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
     /* Every strategy string assigned anywhere in src/ + internal/ as of this
      * commit, plus the two literals pass_calls.c writes directly. */
-    static const char *const lsp[] = {"lsp_direct",         "lsp_base_dispatch",
-                                      "lsp_embed_dispatch", "lsp_implicit_this",
-                                      "lsp_inherited_dispatch", "lsp_method_dispatch",
-                                      "lsp_proc_macro",     "lsp_smart_ptr_dispatch",
-                                      "lsp_strategy_cross_file", "lsp_trait_dispatch",
-                                      "lsp_type_dispatch",  "lsp_virtual_dispatch"};
+    static const char *const lsp[] = {
+        "lsp_direct",         "lsp_base_dispatch",      "lsp_embed_dispatch",
+        "lsp_implicit_this",  "lsp_inherited_dispatch", "lsp_method_dispatch",
+        "lsp_proc_macro",     "lsp_smart_ptr_dispatch", "lsp_strategy_cross_file",
+        "lsp_trait_dispatch", "lsp_type_dispatch",      "lsp_virtual_dispatch"};
     for (size_t i = 0; i < sizeof(lsp) / sizeof(lsp[0]); i++) {
         const char *cls = cbm_mcp_edge_strategy_class(lsp[i]);
         ASSERT_NOT_NULL(cls);
@@ -6093,8 +6117,8 @@ TEST(tool_index_repository_unknown_project_name_still_requires_repo_path) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository",
-                                     "{\"project\":\"never-indexed-project\"}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "index_repository", "{\"project\":\"never-indexed-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "repo_path is required"));
     free(resp);
@@ -6626,13 +6650,13 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     /* `git -C` with double quotes, not `cd '<dir>' &&`: single quotes are not
      * quoting characters for cmd.exe, and identity/branch/signing come from -c
      * so the fixture does not depend on the machine's global git config. The
      * assertions below read `base: main`, so pin init.defaultBranch. */
-#define DC1363_GITCFG                                                                              \
+#define DC1363_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -6661,7 +6685,7 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     char *project = cbm_project_name_from_path(repo);
     ASSERT_NOT_NULL(project);
@@ -6708,7 +6732,7 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
                                  "    return 2\n"),
               0);
 
-#define DC1363B_GITCFG                                                                             \
+#define DC1363B_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -10349,10 +10373,11 @@ TEST(vulcan_managed_profile_authorizes_hidden_context) {
     result = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync_args);
     ASSERT(result != NULL);
     ASSERT(strstr(result, "\"isError\":true") == NULL);
-    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/2\\\"") != NULL);
     ASSERT(strstr(result, "\\\"status\\\":\\\"committed\\\"") != NULL);
     ASSERT(strstr(result, "\\\"accepted\\\":true") != NULL);
-    ASSERT(strstr(result, "\\\"index_status\\\":") != NULL);
+    ASSERT(strstr(result, "\\\"projects\\\":[") != NULL);
+    ASSERT(strstr(result, "\\\"active_job\\\":{") != NULL);
     free(result);
 
     char control_args[CBM_SZ_8K];
@@ -10362,15 +10387,21 @@ TEST(vulcan_managed_profile_authorizes_hidden_context) {
     result = cbm_mcp_handle_tool(server, "vulcan_project_status", control_args);
     ASSERT(result != NULL);
     ASSERT(strstr(result, "\"isError\":true") == NULL);
-    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/2\\\"") != NULL);
     ASSERT(strstr(result, "\\\"project_id\\\":\\\"project-1\\\"") != NULL);
-    ASSERT(strstr(result, "\\\"index_status\\\":") != NULL);
+    ASSERT(strstr(result, "\\\"availability\\\":\\\"unavailable\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"active_job\\\":{") != NULL);
     free(result);
 
-    result = cbm_mcp_handle_tool(server, "vulcan_reindex_project", control_args);
+    char update_args[CBM_SZ_8K];
+    ASSERT(snprintf(update_args, sizeof(update_args),
+                    "{\"contract\":\"%s\",\"project_id\":\"project-1\",\"pwd\":\"%s\","
+                    "\"mode\":\"update\"}",
+                    CBM_VULCAN_MANAGED_CONTRACT, canonical) < (int)sizeof(update_args));
+    result = cbm_mcp_handle_tool(server, "vulcan_update_project_index", update_args);
     ASSERT(result != NULL);
     ASSERT(strstr(result, "\"isError\":true") == NULL);
-    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/1\\\"") != NULL);
+    ASSERT(strstr(result, "\\\"contract\\\":\\\"vulcan.codebase-memory/2\\\"") != NULL);
     ASSERT(strstr(result, "\\\"project_id\\\":\\\"project-1\\\"") != NULL);
     ASSERT(strstr(result, "\\\"accepted\\\":true") != NULL);
     ASSERT(strstr(result, "\\\"coalesced\\\":true") != NULL);
@@ -10407,7 +10438,7 @@ TEST(vulcan_managed_profile_authorizes_hidden_context) {
 
     result = cbm_mcp_handle_tool(server, "get_graph_schema",
                                  "{\"project\":\"forged\",\"_vulcan\":{\"contract\":"
-                                 "\"vulcan.codebase-memory/1\",\"project_id\":\"project-1\","
+                                 "\"vulcan.codebase-memory/2\",\"project_id\":\"project-1\","
                                  "\"pwd\":\"C:/forged\",\"session_id\":\"session-secret\"}}");
     ASSERT(result != NULL);
     ASSERT(strstr(result, "model_project_override") != NULL);
@@ -10585,8 +10616,10 @@ TEST(vulcan_managed_multi_project_reconciliation_is_authoritative) {
                    "{\"project_id\":\"project-1\",\"pwd\":\"%s\"}]}",
                    CBM_VULCAN_MANAGED_CONTRACT, canonical[0]);
     response = cbm_mcp_handle_tool(server, "vulcan_sync_projects", sync);
-    bool scheduling_failure_reported = response && strstr(response, "\\\"failed\\\":1") &&
-                                       strstr(response, "\\\"lifecycle\\\":\\\"failed\\\"");
+    bool scheduling_failure_reported =
+        response && strstr(response, "\\\"failed\\\":1") &&
+        strstr(response, "\\\"availability\\\":\\\"unavailable\\\"") &&
+        strstr(response, "\\\"active_job\\\":null");
     free(response);
     response = NULL;
 

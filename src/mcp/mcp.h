@@ -125,7 +125,24 @@ typedef enum {
     CBM_MCP_MANAGED_INDEX_FAILED = 0,
     CBM_MCP_MANAGED_INDEX_STARTED,
     CBM_MCP_MANAGED_INDEX_RUNNING,
+    CBM_MCP_MANAGED_INDEX_CONFLICT,
 } cbm_mcp_managed_index_status_t;
+
+/* Explicit managed index mode selected by the controller tool.
+ * 控制器工具选择的显式托管索引模式。 */
+typedef enum {
+    CBM_MCP_MANAGED_INDEX_MODE_UPDATE = 1,
+    CBM_MCP_MANAGED_INDEX_MODE_REBUILD,
+} cbm_mcp_managed_index_mode_t;
+
+/* Stable source classification for one managed index request.
+ * 一次托管索引请求的稳定来源分类。 */
+typedef enum {
+    CBM_MCP_MANAGED_INDEX_TRIGGER_INITIAL = 1,
+    CBM_MCP_MANAGED_INDEX_TRIGGER_WATCHER,
+    CBM_MCP_MANAGED_INDEX_TRIGGER_MANUAL,
+    CBM_MCP_MANAGED_INDEX_TRIGGER_RECOVERY,
+} cbm_mcp_managed_index_trigger_t;
 
 /* Daemon-owned side effects used after an atomic registry transition.
  *
@@ -142,7 +159,9 @@ typedef struct {
      * 调度一个 daemon
      * 所有的物理索引，并合并重复任务。 */
     cbm_mcp_managed_index_status_t (*schedule_index)(void *context, const char *project_key,
-                                                     const char *canonical_root, bool force);
+                                                     const char *canonical_root,
+                                                     cbm_mcp_managed_index_mode_t mode,
+                                                     cbm_mcp_managed_index_trigger_t trigger);
     /* Cancel only the registry-owned index for a removed project.
      *
      * 仅取消已移除项目由注册表拥有的索引。 */

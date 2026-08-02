@@ -85,6 +85,9 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    /* Force the staged generation down the full-index path.
+     * 强制暂存代次走完整索引路径。 */
+    bool force_rebuild;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -201,6 +204,14 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+/* Select whether the next run must rebuild the complete staged generation.
+ * 选择下一次运行是否必须完整重建暂存代次。 */
+void cbm_pipeline_set_force_rebuild(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->force_rebuild = enabled;
     }
 }
 
@@ -1851,6 +1862,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                          final_path);
             cleanup_staging_db(staging_path);
         }
+    }
+    if (p->force_rebuild && backup_succeeded) {
+        /* The backup proved the published generation is readable; remove only
+         * the private staging copy so discovery chooses a true full rebuild.
+         * 备份已证明发布代次可读；仅移除私有暂存副本，使发现流程选择真正的完整重建。 */
+        cleanup_staging_db(staging_path);
     }
 
     char *configured_db_path = p->db_path;

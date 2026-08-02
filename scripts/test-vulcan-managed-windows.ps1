@@ -9,7 +9,7 @@
 )
 
 $ErrorActionPreference = 'Stop'
-$Contract = 'vulcan.codebase-memory/1'
+$Contract = 'vulcan.codebase-memory/2'
 
 <#
 .SYNOPSIS
@@ -64,7 +64,7 @@ function Read-McpResponse {
         }
         throw "The MCP frontend closed stdout before returning a response.$ExitDetail"
     }
-    return $Line | ConvertFrom-Json -Depth 100
+    return $Line | ConvertFrom-Json
 }
 
 <#
@@ -121,6 +121,110 @@ function Assert-E2e {
 
 <#
 .SYNOPSIS
+Waits for one exact managed index mode to reach a successful terminal snapshot.
+等待一种精确的托管索引模式到达成功终态快照。
+#>
+function Wait-ManagedIndexJob {
+    param(
+        # Running MCP frontend process.
+        # 正在运行的 MCP 前端进程。
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process,
+
+        # Canonical managed contract.
+        # 规范化托管契约。
+        [Parameter(Mandatory)]
+        [string]$Contract,
+
+        # Managed project identity.
+        # 托管项目身份。
+        [Parameter(Mandatory)]
+        [hashtable]$Project,
+
+        # Expected exact index mode.
+        # 预期的精确索引模式。
+        [Parameter(Mandatory)]
+        [ValidateSet('update', 'rebuild')]
+        [string]$Mode,
+
+        # Minimum revision required after publication.
+        # 发布后要求的最小修订号。
+        [Parameter(Mandatory)]
+        [long]$MinimumRevision,
+
+        # Maximum wait for one MCP response.
+        # 单次 MCP 响应的最长等待时间。
+        [Parameter(Mandatory)]
+        [int]$TimeoutMs
+    )
+
+    # JobIdentity records the first exact identity observed for this request.
+    # JobIdentity 记录本次请求首次观察到的精确任务身份。
+    $JobIdentity = $null
+    for ($Attempt = 0; $Attempt -lt 400; $Attempt++) {
+        $Status = Invoke-McpRequest -Process $Process -TimeoutMs $TimeoutMs -Request @{
+            jsonrpc = '2.0'
+            id = 700 + $Attempt
+            method = 'tools/call'
+            params = @{
+                name = 'vulcan_project_status'
+                arguments = @{
+                    contract = $Contract
+                    project_id = $Project.project_id
+                    pwd = $Project.pwd
+                }
+            }
+        }
+        $StatusBody = $Status.result.content[0].text | ConvertFrom-Json
+        if ($StatusBody.last_error) {
+            throw "Managed indexing failed for $($Project.project_id): $($StatusBody.last_error.code) - $($StatusBody.last_error.message)"
+        }
+
+        # CandidateJob prefers the live job and then the immutable terminal snapshot.
+        # CandidateJob 优先使用实时任务，其次使用不可变终态快照。
+        $CandidateJob = if ($StatusBody.active_job -and $StatusBody.active_job.mode -eq $Mode) {
+            $StatusBody.active_job
+        }
+        elseif ($StatusBody.last_job -and $StatusBody.last_job.mode -eq $Mode) {
+            $StatusBody.last_job
+        }
+        else {
+            $null
+        }
+        if ($CandidateJob) {
+            $CandidateIdentity = "$($CandidateJob.runtime_id):$($CandidateJob.job_id):$($CandidateJob.job_generation)"
+            if (-not $JobIdentity) {
+                $JobIdentity = $CandidateIdentity
+            }
+            Assert-E2e -Condition ($CandidateIdentity -eq $JobIdentity) `
+                -Message "Managed index job identity changed while polling $Mode."
+            Assert-E2e -Condition ($CandidateJob.completed_units -ge 0) `
+                -Message "Managed index job reported an invalid completed unit count for $Mode."
+        }
+
+        if ($StatusBody.last_job -and
+            $StatusBody.last_job.mode -eq $Mode -and
+            $StatusBody.last_job.state -eq 'succeeded' -and
+            $StatusBody.revision -ge $MinimumRevision) {
+            Assert-E2e -Condition ($StatusBody.last_job.trigger -eq 'manual') `
+                -Message "Managed index job returned the wrong trigger for $Mode."
+            Assert-E2e -Condition ($StatusBody.last_job.phase -eq 'finalizing') `
+                -Message "Managed index job returned the wrong terminal phase for $Mode."
+            Assert-E2e -Condition ($null -eq $StatusBody.active_job) `
+                -Message "Managed index job remained active after successful $Mode publication."
+            Assert-E2e -Condition ($StatusBody.availability -in @('ready', 'degraded')) `
+                -Message "Managed project did not remain queryable after $Mode publication."
+            Assert-E2e -Condition (-not [string]::IsNullOrWhiteSpace($JobIdentity)) `
+                -Message "Managed index job identity was never observable for $Mode."
+            return $StatusBody
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    throw "Managed index job did not complete: $($Project.project_id) mode=$Mode"
+}
+
+<#
+.SYNOPSIS
 Removes only the exact test-owned temporary tree.
 仅删除测试拥有的精确临时目录树。
 #>
@@ -168,13 +272,19 @@ try {
     [void](New-Item -ItemType Directory -Path $CacheRoot -Force)
     foreach ($ProjectRoot in $ProjectRoots) {
         [void](New-Item -ItemType Directory -Path $ProjectRoot -Force)
-        Set-Content -LiteralPath (Join-Path $ProjectRoot 'main.c') -Value 'int main(void) { return 0; }' `
-            -Encoding utf8NoBOM
+        # Utf8NoBomEncoding keeps the fixture identical on Windows PowerShell and PowerShell 7.
+        # Utf8NoBomEncoding 确保夹具在 Windows PowerShell 与 PowerShell 7 下完全一致。
+        $Utf8NoBomEncoding = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText(
+            (Join-Path $ProjectRoot 'main.c'),
+            'int main(void) { return 0; }',
+            $Utf8NoBomEncoding
+        )
     }
 
     $Start = [System.Diagnostics.ProcessStartInfo]::new()
     $Start.FileName = $CanonicalExecutable
-    $Start.ArgumentList.Add('--vulcan-managed')
+    $Start.Arguments = '--vulcan-managed'
     $Start.WorkingDirectory = $ProjectRoots[0]
     $Start.UseShellExecute = $false
     $Start.RedirectStandardInput = $true
@@ -212,7 +322,7 @@ try {
     }
     $ToolNames = @($Tools.result.tools | ForEach-Object { $_.name })
     foreach ($RequiredTool in @('vulcan_sync_projects', 'vulcan_project_status',
-            'vulcan_reindex_project', 'get_graph_schema')) {
+            'vulcan_update_project_index', 'get_graph_schema')) {
         Assert-E2e -Condition ($ToolNames -contains $RequiredTool) `
             -Message "Managed tool surface is missing $RequiredTool."
     }
@@ -261,10 +371,11 @@ try {
                 }
             }
             $StatusBody = $Status.result.content[0].text | ConvertFrom-Json
-            if ($StatusBody.lifecycle -eq 'failed') {
-                throw "Managed indexing failed for $($Project.project_id): $($StatusBody.last_error_code)"
+            if ($StatusBody.last_error) {
+                throw "Managed indexing failed for $($Project.project_id): $($StatusBody.last_error.code)"
             }
-            $Ready = $StatusBody.lifecycle -eq 'ready'
+            $Ready = $StatusBody.availability -in @('ready', 'degraded') -and
+                $null -eq $StatusBody.active_job -and $StatusBody.revision -gt 0
             if (-not $Ready) {
                 Start-Sleep -Milliseconds 50
             }
@@ -315,6 +426,74 @@ try {
             -Message "Managed Windows text search returned no grep matches for $($Project.project_id)."
     }
 
+    # Exercise both explicit modes against the first published project.
+    # 针对首个已发布项目实际执行两种显式模式。
+    $ControlledProject = $Projects[0]
+    $InitialStatus = Invoke-McpRequest -Process $Process -TimeoutMs $ResponseTimeoutMs -Request @{
+        jsonrpc = '2.0'
+        id = 600
+        method = 'tools/call'
+        params = @{
+            name = 'vulcan_project_status'
+            arguments = @{
+                contract = $Contract
+                project_id = $ControlledProject.project_id
+                pwd = $ControlledProject.pwd
+            }
+        }
+    }
+    $InitialStatusBody = $InitialStatus.result.content[0].text | ConvertFrom-Json
+    $InitialRevision = [long]$InitialStatusBody.revision
+    [System.IO.File]::AppendAllText(
+        (Join-Path $ControlledProject.pwd 'main.c'),
+        "`nint managed_update_probe(void) { return 1; }",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $Update = Invoke-McpRequest -Process $Process -TimeoutMs $ResponseTimeoutMs -Request @{
+        jsonrpc = '2.0'
+        id = 601
+        method = 'tools/call'
+        params = @{
+            name = 'vulcan_update_project_index'
+            arguments = @{
+                contract = $Contract
+                project_id = $ControlledProject.project_id
+                pwd = $ControlledProject.pwd
+                mode = 'update'
+            }
+        }
+    }
+    $UpdateBody = $Update.result.content[0].text | ConvertFrom-Json
+    Assert-E2e -Condition ($UpdateBody.accepted -and $UpdateBody.mode -eq 'update') `
+        -Message 'Managed update request was not accepted with the exact mode.'
+    $UpdatedStatus = Wait-ManagedIndexJob -Process $Process -Contract $Contract `
+        -Project $ControlledProject -Mode 'update' -MinimumRevision ($InitialRevision + 1) `
+        -TimeoutMs $ResponseTimeoutMs
+
+    $Rebuild = Invoke-McpRequest -Process $Process -TimeoutMs $ResponseTimeoutMs -Request @{
+        jsonrpc = '2.0'
+        id = 602
+        method = 'tools/call'
+        params = @{
+            name = 'vulcan_update_project_index'
+            arguments = @{
+                contract = $Contract
+                project_id = $ControlledProject.project_id
+                pwd = $ControlledProject.pwd
+                mode = 'rebuild'
+            }
+        }
+    }
+    $RebuildBody = $Rebuild.result.content[0].text | ConvertFrom-Json
+    Assert-E2e -Condition ($RebuildBody.accepted -and $RebuildBody.mode -eq 'rebuild') `
+        -Message 'Managed rebuild request was not accepted with the exact mode.'
+    $RebuiltStatus = Wait-ManagedIndexJob -Process $Process -Contract $Contract `
+        -Project $ControlledProject -Mode 'rebuild' -MinimumRevision ([long]$UpdatedStatus.revision + 1) `
+        -TimeoutMs $ResponseTimeoutMs
+    Assert-E2e -Condition ([long]$RebuiltStatus.revision -gt [long]$UpdatedStatus.revision) `
+        -Message 'Managed rebuild did not publish a newer revision.'
+
     $Process.StandardInput.Close()
     Assert-E2e -Condition $Process.WaitForExit(10000) `
         -Message 'Managed MCP frontend did not exit after stdin closed.'
@@ -335,11 +514,11 @@ try {
     Assert-E2e -Condition ($CreatedDaemonIds.Count -eq 0) `
         -Message 'Application-scoped managed daemon survived the final MCP frontend session.'
 
-    Write-Host 'Vulcan managed Windows E2E passed: 3 projects, hidden routing, app-scoped daemon.'
+    Write-Host 'Vulcan managed Windows E2E passed: 3 projects, V2 update/rebuild progress, hidden routing, app-scoped daemon.'
 }
 finally {
     if ($Process -and -not $Process.HasExited) {
-        $Process.Kill($true)
+        $Process.Kill()
         [void]$Process.WaitForExit(5000)
     }
 
