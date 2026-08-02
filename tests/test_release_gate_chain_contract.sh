@@ -27,7 +27,7 @@ import pathlib
 import re
 import sys
 
-text = pathlib.Path(sys.argv[1]).read_text()
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 
 # Slice the file into top-level job blocks: two-space indented "name:".
 blocks, current, name = {}, [], None

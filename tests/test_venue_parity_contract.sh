@@ -165,7 +165,7 @@ def walk_runs(path: pathlib.Path):
     an unrecognized run: form is itself a contract failure. Heredoc bodies
     are opaque data (the OPENER line still gets classified)."""
     name = "?"
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     i = 0
     while i < len(lines):
         raw = lines[i]
@@ -201,7 +201,7 @@ def walk_runs(path: pathlib.Path):
 
 seen = 0
 for path in sorted(workflows.glob("*.yml")):
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     seen += 1
     for number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
@@ -246,7 +246,7 @@ REQUIRED = [
 ]
 for name, pattern, why in REQUIRED:
     path = workflows / name
-    if path.exists() and not re.search(pattern, path.read_text()):
+    if path.exists() and not re.search(pattern, path.read_text(encoding="utf-8")):
         failures.append(f"{name}: missing required `{pattern}` — {why}")
 
 # Defender posture: hosted Windows runners have real-time protection
@@ -257,7 +257,7 @@ for name, pattern, why in REQUIRED:
 # allows it.
 for name in ("_test.yml", "pr.yml"):
     path = workflows / name
-    if path.exists() and "ensure-defender.ps1" in path.read_text():
+    if path.exists() and "ensure-defender.ps1" in path.read_text(encoding="utf-8"):
         failures.append(
             f"{name}: ensure-defender.ps1 must not gate hosted runners — RTP is "
             f"policy-locked off there; the VM preflight owns Defender-ON coverage")
@@ -265,7 +265,7 @@ for name in ("_test.yml", "pr.yml"):
 # ── Layer 4: the local venues route through the same entries ──
 compose = root / "test-infrastructure" / "docker-compose.yml"
 if compose.exists():
-    text = compose.read_text()
+    text = compose.read_text(encoding="utf-8")
     for number, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if s.startswith("#"):
@@ -280,7 +280,7 @@ for local in ["test-infrastructure/vm/win.sh",
     path = root / local
     if not path.exists():
         continue
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     for number, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if s.startswith("#"):
@@ -310,7 +310,7 @@ LOCAL_REQUIRED = [
 ]
 for local, pattern, why in LOCAL_REQUIRED:
     path = root / local
-    if path.exists() and not re.search(pattern, path.read_text()):
+    if path.exists() and not re.search(pattern, path.read_text(encoding="utf-8")):
         failures.append(f"{local}: missing required `{pattern}` — {why}")
 
 if failures:
