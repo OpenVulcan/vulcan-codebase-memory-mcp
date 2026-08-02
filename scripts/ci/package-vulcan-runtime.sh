@@ -51,7 +51,7 @@ rm -rf "$PACKAGE_DIR" "$ARCHIVE"
 mkdir "$PACKAGE_DIR"
 cp "build/c/$EXECUTABLE" "$PACKAGE_DIR/$EXECUTABLE"
 SHA256=$(sha256_file "$PACKAGE_DIR/$EXECUTABLE")
-printf '{\n  "protocol": "vulcan.codebase-memory/1",\n  "version": "%s",\n  "platform": "%s",\n  "executable": "%s",\n  "sha256": "%s"\n}\n' \
+printf '{\n  "protocol": "vulcan.codebase-memory/2",\n  "version": "%s",\n  "platform": "%s",\n  "executable": "%s",\n  "sha256": "%s"\n}\n' \
     "$VERSION" "$PLATFORM" "$EXECUTABLE" "$SHA256" > "$PACKAGE_DIR/manifest.json"
 
 if [[ "$PLATFORM" == windows-* ]]; then
