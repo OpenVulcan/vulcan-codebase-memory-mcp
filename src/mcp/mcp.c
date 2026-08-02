@@ -11477,10 +11477,16 @@ static char *handle_vulcan_sync_projects(cbm_mcp_server_t *srv, const char *args
     free(keys);
     yyjson_doc_free(doc);
     if (!committed) {
-        const char *code = sync.status == CBM_MANAGED_SYNC_STALE_GENERATION ? "stale_generation"
-                           : sync.status == CBM_MANAGED_SYNC_CONFLICT       ? "project_conflict"
-                           : sync.status == CBM_MANAGED_SYNC_NO_MEMORY ? "no_memory"
-                                                                       : "invalid_sync_request";
+        /* Map the closed synchronization status set to its stable wire error code.
+         * 将封闭的同步状态集合映射为稳定的线上错误代码。 */
+        const char *code = "invalid_sync_request";
+        if (sync.status == CBM_MANAGED_SYNC_STALE_GENERATION) {
+            code = "stale_generation";
+        } else if (sync.status == CBM_MANAGED_SYNC_CONFLICT) {
+            code = "project_conflict";
+        } else if (sync.status == CBM_MANAGED_SYNC_NO_MEMORY) {
+            code = "no_memory";
+        }
         cbm_managed_sync_result_free(&sync);
         cbm_managed_project_registry_reconcile_end(srv->managed_projects);
         return managed_error_result(code, "Project synchronization was rejected");

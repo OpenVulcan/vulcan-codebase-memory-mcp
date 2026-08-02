@@ -2605,9 +2605,9 @@ static cbm_mcp_managed_index_status_t application_managed_schedule_index(
     /* Exact registry job identity created before any worker thread can start.
      * 在任何工作线程启动前创建的精确注册表任务身份。 */
     cbm_managed_job_snapshot_t managed_job = {0};
-    cbm_managed_job_begin_status_t begin_status = cbm_managed_project_registry_begin_job(
-        application->managed_projects, project_key, mode, trigger, cbm_unix_epoch_ms(),
-        &managed_job);
+    cbm_managed_job_begin_status_t begin_status =
+        cbm_managed_project_registry_begin_job(application->managed_projects, project_key, mode,
+                                               trigger, cbm_unix_epoch_ms(), &managed_job);
     if (begin_status == CBM_MANAGED_JOB_BEGIN_CONFLICT) {
         free(arguments);
         return CBM_MCP_MANAGED_INDEX_CONFLICT;

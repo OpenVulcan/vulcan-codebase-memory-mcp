@@ -149,11 +149,10 @@ uint64_t cbm_now_ms(void) {
  * 返回墙上时钟 Unix 毫秒数，同时不改变单调时钟截止时间调用方。 */
 uint64_t cbm_unix_epoch_ms(void) {
     FILETIME file_time;
-    ULARGE_INTEGER ticks;
     GetSystemTimeAsFileTime(&file_time);
-    ticks.LowPart = file_time.dwLowDateTime;
-    ticks.HighPart = file_time.dwHighDateTime;
-    const uint64_t milliseconds_since_1601 = ticks.QuadPart / UINT64_C(10000);
+    const uint64_t ticks =
+        ((uint64_t)file_time.dwHighDateTime << 32U) | (uint64_t)file_time.dwLowDateTime;
+    const uint64_t milliseconds_since_1601 = ticks / UINT64_C(10000);
     const uint64_t unix_epoch_offset_ms = UINT64_C(11644473600000);
     return milliseconds_since_1601 >= unix_epoch_offset_ms
                ? milliseconds_since_1601 - unix_epoch_offset_ms
