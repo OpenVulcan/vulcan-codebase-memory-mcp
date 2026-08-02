@@ -928,11 +928,11 @@ $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
 	echo "=== build config changed -> full rebuild: $(BUILD_CONFIG_SIG) ==="; fi
 
 $(CBM_PROGRAM): $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -DCBM_VULCAN_PRODUCT=1 -o $@ \
-		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_PROD) \
-		$(LDFLAGS)
+	# Keep the production link below the Windows CreateProcess command-line limit.
+	# 将生产链接参数写入响应文件，避免超过 Windows CreateProcess 命令行长度上限。
+	$(file >$@.rsp,$(CFLAGS_PROD) -DCBM_VULCAN_PRODUCT=1 -o $@ $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(LDFLAGS))
+	$(CC) @$@.rsp
+	@rm -f $@.rsp
 
 cbm: $(CBM_PROGRAM)
 	@echo "Built: $(CBM_PROGRAM)"
