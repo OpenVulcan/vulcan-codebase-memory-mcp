@@ -4,6 +4,25 @@
 
 set -euo pipefail
 
+# Compute a SHA-256 digest with the native tool available on the runner.
+# 使用运行器原生提供的工具计算 SHA-256 摘要。
+sha256_file() {
+    local file_path="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" | awk '{print $1}'
+        return
+    fi
+
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file_path" | awk '{print $1}'
+        return
+    fi
+
+    echo "No SHA-256 command is available on this runner." >&2
+    return 127
+}
+
 if [ "$#" -ne 2 ]; then
     echo "Usage: scripts/ci/package-vulcan-runtime.sh <platform> <version>" >&2
     exit 2
@@ -31,7 +50,7 @@ esac
 rm -rf "$PACKAGE_DIR" "$ARCHIVE"
 mkdir "$PACKAGE_DIR"
 cp "build/c/$EXECUTABLE" "$PACKAGE_DIR/$EXECUTABLE"
-SHA256=$(sha256sum "$PACKAGE_DIR/$EXECUTABLE" | awk '{print $1}')
+SHA256=$(sha256_file "$PACKAGE_DIR/$EXECUTABLE")
 printf '{\n  "protocol": "vulcan.codebase-memory/1",\n  "version": "%s",\n  "platform": "%s",\n  "executable": "%s",\n  "sha256": "%s"\n}\n' \
     "$VERSION" "$PLATFORM" "$EXECUTABLE" "$SHA256" > "$PACKAGE_DIR/manifest.json"
 
